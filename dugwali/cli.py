@@ -3,6 +3,10 @@
   python -m dugwali.cli note "방금 김과장님 통화함. 견적서 금요일까지 다시 달라고 함"
   python -m dugwali.cli transcribe 녹음.m4a      # 전사 속도·화자 구분 측정
   python -m dugwali.cli digest
+  python -m dugwali.cli cases                    # 진행 중인 건 목록
+  python -m dugwali.cli case 3                   # 3번 건 통합 정리
+  python -m dugwali.cli merge 5 3                # 5번 기록을 3번 건에 합치기
+  python -m dugwali.cli delete 5                 # 5번 기록 삭제
   python -m dugwali.cli check                    # claude 헤드리스 호출 점검
 """
 import argparse
@@ -24,6 +28,14 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--speakers", type=int, default=2)
     sub.add_parser("digest", help="오늘 다이제스트")
     sub.add_parser("check", help="LLM 호출 점검")
+    sub.add_parser("cases", help="진행 중인 건 목록")
+    c = sub.add_parser("case", help="건 통합 정리")
+    c.add_argument("case_id", type=int)
+    m = sub.add_parser("merge", help="기록을 다른 건에 합치기")
+    m.add_argument("record_id", type=int)
+    m.add_argument("case_id", type=int)
+    d_ = sub.add_parser("delete", help="기록 삭제")
+    d_.add_argument("record_id", type=int)
     args = p.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -41,6 +53,20 @@ def main(argv: list[str] | None = None) -> int:
               f"(실시간 대비 {r['elapsed'] / max(r['duration'], 1):.2f}배), 화자 구분: {r['diarized']}")
     elif args.cmd == "digest":
         print(digest.build(Store(cfg.db_path)))
+    elif args.cmd == "cases":
+        store = Store(cfg.db_path)
+        for c in store.open_cases():
+            ids = ", ".join(str(r["id"]) for r in store.case_records(c["id"]))
+            print(f"#{c['id']} {c['title']} · 기록 {c['n_records']}건(번호 {ids}) · 할 일 {c['n_todos']}건")
+    elif args.cmd == "case":
+        data = pipeline.case_summary(Store(cfg.db_path), args.case_id)
+        print(render.slack(data) if data else "정리할 기록이 없습니다.")
+    elif args.cmd == "merge":
+        rec = pipeline.merge(Store(cfg.db_path), args.record_id, args.case_id)
+        print(f"기록 {rec['id']} → 건 #{rec['case_id']}")
+    elif args.cmd == "delete":
+        rec = pipeline.delete(Store(cfg.db_path), args.record_id)
+        print(f"기록 {args.record_id} 삭제" if rec else "그런 기록이 없습니다.")
     else:
         rec = pipeline.process(Store(cfg.db_path), args.text, "cli")
         d = rec["data"]
@@ -48,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n===== {label} =====\n{fn(d)}")
         if d["ask_user"]:
             print("\n===== 되묻기 =====\n" + "\n".join(d["ask_user"]))
+        print(f"\n기록 {rec['id']} / 건 #{rec['case_id']}"
+              + (f" / 관련 건 제안: #{d['related_case']}" if d.get("related_case") else ""))
         print(f"\n로그: {cfg.log_dir / (rec['created_at'][:10] + '.md')}")
     return 0
 

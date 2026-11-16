@@ -77,10 +77,10 @@ def verbal(d: dict) -> str:
     return "\n".join(lines)
 
 
-def markdown(d: dict, when: str, source: str) -> str:
-    """업무 로그(Markdown) 한 건."""
-    lines = [f"## {when} [{d['kind']}] {d['title']}", ""]
-    meta = [f"경로: {source}"]
+def markdown(d: dict, when: str, source: str, case: str | None = None, level: int = 2) -> str:
+    """업무 로그(Markdown) 기록 하나. case: "#3 제목" 형태의 건 표시."""
+    lines = [f"{'#' * level} {when} [{d['kind']}] {d['title']}", ""]
+    meta = ([f"건: {case}"] if case else []) + [f"경로: {source}"]
     if d.get("counterpart"):
         meta.append(f"상대: {d['counterpart']}")
     if d.get("share_to"):

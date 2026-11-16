@@ -1,16 +1,61 @@
-"""입구(슬랙·통화·CLI)와 무관한 핵심 흐름: 추출 → 저장 → 로그 갱신."""
+"""입구(슬랙·통화·CLI)와 무관한 핵심 흐름: 추출 → 저장 → 로그 갱신.
+
+기록(메모·통화 1개)은 건(같은 일의 묶음)에 속한다. 새 기록은 새 건으로 시작하고,
+관련 건은 제안만 한다(`data["related_case"]`). 합치는 것은 사용자가 정한다.
+"""
+import logging
+
 from .agent import extract as ex
-from .sinks import markdown as md_sink
+from .agent.llm import LLMError
 from .labels import SOURCE_LABEL
-from .store import Store
+from .sinks import markdown as md_sink
+from .store import UNTITLED, Store
+
+log = logging.getLogger(__name__)
+SUGGEST_DAYS = 14   # 이 기간 안에 갱신된 건만 관련 건 후보로 보낸다
+SUGGEST_MAX = 20
+
+
+def _label(source: str) -> str:
+    return SOURCE_LABEL.get(source, source)
+
+
+def _refresh(store: Store, days: set[str] = frozenset(), cases: set[int] = frozenset()) -> None:
+    for day in days:
+        md_sink.rewrite_day(store, day)
+    for cid in cases:
+        if cid is not None:
+            md_sink.rewrite_case(store, cid)
+
+
+def _candidates(store: Store, exclude: int | None = None) -> list[tuple[int, str]]:
+    return [(c["id"], c["title"]) for c in store.open_cases(days=SUGGEST_DAYS)
+            if c["id"] != exclude and c["title"] != UNTITLED][:SUGGEST_MAX]
+
+
+def _reconcile(store: Store, cid: int | None) -> None:
+    """건의 할 일을 현재 기록 구성에 맞춘다.
+
+    기록이 여럿이면 통합 정리의 할 일로 바꿔 기록마다 겹쳐 나온 할 일을 하나로 줄인다.
+    통합 정리(LLM)가 실패해도 병합·수정 자체는 유지하고, 할 일은 기록별 그대로 둔다.
+    """
+    if cid is None or not store.get_case(cid):
+        return
+    recs = [r for r in store.case_records(cid) if r["data"]]
+    if len(recs) == 1:
+        store.replace_case_todos(cid, recs[0]["data"]["todos"])
+    elif len(recs) > 1:
+        try:
+            store.replace_case_todos(cid, case_summary(store, cid)["todos"])
+        except LLMError:
+            log.exception("건 #%s 통합 정리 실패, 할 일은 기록별로 둡니다", cid)
 
 
 def process(store: Store, raw_text: str, source: str = "slack", audio_path: str | None = None) -> dict:
-    """새 기록을 만들고 구조화한다."""
-    data = ex.extract(raw_text, SOURCE_LABEL.get(source, source))
-    rid = store.add_record(source, raw_text, data, audio_path)
-    rec = store.get_record(rid)
-    md_sink.rewrite_day(store, rec["created_at"][:10])
+    """새 기록을 만들고 구조화한다. 새 건으로 시작한다."""
+    data = ex.extract(raw_text, _label(source), cases=_candidates(store))
+    rec = store.get_record(store.add_record(source, raw_text, data, audio_path))
+    _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
     return rec
 
 
@@ -22,9 +67,10 @@ def hold(store: Store, raw_text: str, source: str, audio_path: str | None = None
 def summarize(store: Store, rid: int) -> dict:
     """보관만 해 둔 기록을 사용자가 승인했을 때 구조화한다."""
     rec = store.get_record(rid)
-    data = ex.extract(rec["raw_text"], SOURCE_LABEL.get(rec["source"], rec["source"]))
+    data = ex.extract(rec["raw_text"], _label(rec["source"]), cases=_candidates(store, rec["case_id"]))
     store.update_record(rid, data=data)
-    md_sink.rewrite_day(store, rec["created_at"][:10])
+    _reconcile(store, rec["case_id"])
+    _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
     return store.get_record(rid)
 
 
@@ -32,7 +78,71 @@ def amend(store: Store, rid: int, extra: str) -> dict:
     """스레드 답글로 들어온 보충 정보를 합쳐 다시 구조화한다."""
     rec = store.get_record(rid)
     raw = f"{rec['raw_text']}\n\n[작성자 보충] {extra}"
-    data = ex.extract(raw, SOURCE_LABEL.get(rec["source"], rec["source"]))
+    data = ex.extract(raw, _label(rec["source"]))
     store.update_record(rid, raw_text=raw, data=data)
-    md_sink.rewrite_day(store, rec["created_at"][:10])
+    _reconcile(store, rec["case_id"])
+    _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
     return store.get_record(rid)
+
+
+def merge(store: Store, rid: int, cid: int) -> dict:
+    """기록을 다른 건으로 옮긴다(병합·사후 보강)."""
+    rec, case = store.get_record(rid), store.get_case(cid)
+    if not rec or not case:
+        raise ValueError("기록 또는 건을 찾지 못했습니다.")
+    old = rec["case_id"]
+    store.move_record(rid, cid)
+    if case["status"] != "open":
+        store.reopen_case(cid)
+    if rec["data"] and rec["data"].get("related_case") is not None:
+        store.update_record(rid, data={**rec["data"], "related_case": None})  # 제안 버튼을 다시 띄우지 않는다
+    _reconcile(store, cid)
+    _reconcile(store, old)
+    _refresh(store, {rec["created_at"][:10]}, {old, cid})
+    return store.get_record(rid)
+
+
+def delete(store: Store, rid: int) -> dict | None:
+    rec = store.delete_record(rid)
+    if rec:
+        _reconcile(store, rec["case_id"])
+        _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
+    return rec
+
+
+def delete_case(store: Store, cid: int) -> int:
+    recs = store.delete_case(cid)
+    _refresh(store, {r["created_at"][:10] for r in recs}, {cid})
+    return len(recs)
+
+
+def close(store: Store, cid: int) -> None:
+    store.close_case(cid)
+    _refresh(store, cases={cid})
+
+
+def case_summary(store: Store, cid: int) -> dict | None:
+    """건 전체를 하나로 정리한 결과. 기록이 하나면 그 기록 그대로, 여럿이면 LLM으로 종합한다.
+
+    LLM으로 보낸 적 없는 기록(요약 승인 전 통화 전사문)은 종합에서도 제외한다.
+    """
+    case = store.get_case(cid)
+    if not case:
+        return None
+    recs = [r for r in store.case_records(cid) if r["data"]]
+    if not recs:
+        return None
+    if len(recs) == 1:
+        return recs[0]["data"]
+    if case["data"] and not case["dirty"]:
+        return case["data"]
+    text = "\n\n".join(
+        f"[기록 {i}] {r['created_at'][:16].replace('T', ' ')} ({_label(r['source'])})\n{r['raw_text']}"
+        for i, r in enumerate(recs, 1))
+    done = store.done_tasks(cid)
+    if done:
+        text += "\n\n[이미 완료 처리한 할 일 - todos에 넣지 말 것]\n" + "\n".join(f"- {t}" for t in done)
+    data = ex.extract(text, "한 건의 여러 기록(시간순)")
+    store.set_case_summary(cid, data)
+    _refresh(store, {r["created_at"][:10] for r in recs}, {cid})
+    return data
