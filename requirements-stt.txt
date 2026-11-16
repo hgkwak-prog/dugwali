@@ -1,5 +1,7 @@
 # 통화 녹음·음성 메모 전사용 (용량 큼). 텍스트 메모만 쓸 거면 설치하지 않아도 됩니다.
 faster-whisper>=1.0
+# PyAV 19는 faster-whisper 1.2.1이 넘기는 metadata_errors 인자를 받지 않아 전사가 실패합니다.
+av<19
 # 화자 구분(선택). HF_TOKEN 과 모델 약관 동의가 필요합니다.
 # pyannote.audio>=3.1
 # torch
