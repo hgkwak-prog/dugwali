@@ -3,7 +3,8 @@
 - 표준 라이브러리만 쓴다(설치할 것이 늘지 않게). 화면은 서버가 그린 HTML이고 스크립트 없이 동작한다.
 - 이 PC 밖에서는 열리지 않는다: 127.0.0.1에만 바인딩하고, Host 헤더가 이 주소가 아니면 거절한다.
 - 모든 쓰기(POST)는 실행할 때마다 새로 만드는 토큰을 확인한다. 다른 웹사이트가 몰래 요청을 보내지 못한다.
-- 쓰기는 슬랙 버튼과 같은 내부 함수(`pipeline.py`)를 거친다.
+- 쓰기는 슬랙 버튼과 같은 내부 함수(`pipeline.py`)를 거친다. 고친 내용은 슬랙 초안에도 반영한다.
+- 삭제는 휴지통으로 옮기는 것이고, 화면을 여는 것만으로는 LLM을 부르지 않는다.
 
 슬랙 봇 없이도 뜬다(`python -m dugwali.cli dashboard`). 그때는 슬랙이 필요한 동작만 빠진다.
 """
@@ -11,17 +12,18 @@ import hmac
 import logging
 import secrets
 import threading
-from datetime import date
+import re
+from datetime import date, datetime
 from html import escape as e
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import digest, pipeline, profile
+from . import digest, pipeline, profile, views
 from .config import cfg
 from .ingest import transcript
 from .labels import SOURCE_LABEL
-from .store import Store
+from .store import TRASH_DAYS, UNTITLED, Store
 from .stt.transcribe import local_available
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,12 @@ QUESTION_DAYS = 14       # 이 기간 안의 기록에서 아직 답하지 않�
 MAX_BODY = 5_000_000     # 붙여 넣는 전사문 크기 상한(바이트)
 STAGE_LABEL = {"extract": "정리", "call": "통화 녹음 처리", "voice": "음성 메모 전사", "digest": "마감 정리 전송"}
 STT_STAGES = ("call", "voice")
+_UNDO = re.compile(r"^(case|record|todo):\d+$")
+
+
+class Flash(str):
+    """알림 문구. undo("record:5" 등)가 있으면 되돌리기 버튼을 함께 보여준다."""
+    undo = ""
 
 CSS = """
 :root{--bg:#f6f7f9;--card:#fff;--text:#1c2024;--muted:#667085;--line:#e3e6ea;--accent:#2f6fed;
@@ -51,7 +59,7 @@ h1{font-size:22px;margin:4px 0 14px}h2{font-size:16px;margin:26px 0 10px}h3{font
 .muted{color:var(--muted)}.small{font-size:13px}
 .badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;background:var(--line);color:var(--text);margin-left:6px}
 .badge.warn{background:var(--warn-bg);color:var(--warn)}.badge.ok{background:var(--ok-bg);color:var(--ok)}
-.flash{background:var(--ok-bg);color:var(--ok);border-radius:8px;padding:10px 14px;margin:0 0 14px}
+.flash{background:var(--ok-bg);color:var(--ok);border-radius:8px;padding:10px 14px;margin:0 0 14px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 .notice{background:var(--warn-bg);color:var(--warn);border-radius:8px;padding:10px 14px;margin:10px 0}
 ul{margin:4px 0;padding-left:20px}li{margin:2px 0}
 .label{font-weight:600;margin-top:10px}
@@ -62,6 +70,12 @@ button.primary{background:var(--accent);border-color:var(--accent);color:var(--o
 button:hover{filter:brightness(.96)}
 textarea,input[type=text]{width:100%;font:inherit;padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--text)}
 textarea{min-height:260px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+textarea.short{min-height:74px;font-family:inherit;font-size:15px}
+select{font:inherit;padding:5px 8px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--text)}
+.actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.fields{display:flex;gap:8px;flex-wrap:wrap}.fields input{flex:1;min-width:120px}
+button.danger{color:var(--danger)}a.btn{display:inline-block;padding:5px 12px;border-radius:7px;border:1px solid var(--line);color:var(--text)}
+a.btn.danger{color:var(--danger)}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;margin:8px 0}
 details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:8px}
 .todo{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:8px 0;border-top:1px solid var(--line)}
@@ -127,11 +141,16 @@ class Dashboard:
             self._server.server_close()
 
     # ---------- 공통 틀 ----------
-    def _form(self, action: str, label: str, back: str, primary: bool = False, fields: dict | None = None) -> str:
-        hidden = "".join(f'<input type="hidden" name="{e(k)}" value="{e(str(v))}">'
-                         for k, v in {"token": self.token, "next": back, **(fields or {})}.items())
-        cls = ' class="primary"' if primary else ""
-        return f'<form class="inline" method="post" action="{e(action)}">{hidden}<button{cls}>{e(label)}</button></form>'
+    def _hidden(self, back: str = "", fields: dict | None = None) -> str:
+        return "".join(f'<input type="hidden" name="{e(k)}" value="{e(str(v))}">'
+                       for k, v in {"token": self.token, "next": back, **(fields or {})}.items())
+
+    def _form(self, action: str, label: str, back: str, primary: bool = False, fields: dict | None = None,
+              cls: str = "") -> str:
+        cls = "primary" if primary else cls
+        cls = f' class="{cls}"' if cls else ""
+        return (f'<form class="inline" method="post" action="{e(action)}">{self._hidden(back, fields)}'
+                f"<button{cls}>{e(label)}</button></form>")
 
     def _missed(self) -> list[Path] | None:
         watcher = getattr(self.bot, "watcher", None)
@@ -142,9 +161,15 @@ class Dashboard:
         n = len(failures) + len(pending) + len(self._missed() or [])
         tabs = [("/", "건", "cases"), ("/todos", "할 일", "todos"),
                 ("/attention", "조치 필요" + (f' <span class="badge warn">{n}</span>' if n else ""), "attention"),
-                ("/import", "전사문 가져오기", "import"), ("/profile", "프로필", "profile")]
+                ("/import", "전사문 가져오기", "import"), ("/profile", "프로필", "profile"), ("/trash", "휴지통", "trash")]
         nav = "".join(f'<a href="{h}" class="{"on" if k == active else ""}">{label}</a>' for h, label, k in tabs)
-        flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
+        undo = getattr(msg, "undo", "")
+        if _UNDO.match(undo):
+            kind, target = undo.split(":")
+            undo = self._form("/trash/restore", "되돌리기", "/", fields={"kind": kind, "id": target})
+        else:
+            undo = ""
+        flash = f'<div class="flash"><span>{e(msg)}</span>{undo}</div>' if msg else ""
         return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8">'
                 f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)} · 두괄이</title>'
                 f"<style>{CSS}</style></head><body><header><nav><span class=\"brand\">두괄이</span>{nav}</nav></header>"
@@ -174,11 +199,19 @@ class Dashboard:
         tag = f'<span class="over">{e(tag)}</span>' if tag.startswith("⚠️") else f'<span class="muted">{e(tag)}</span>'
         who = "" if digest.is_mine(t) else f'<span class="muted">{e(t["owner"])}: </span>'
         case = f' <a class="small" href="/cases/{t["case_id"]}">#{t["case_id"]}</a>' if show_case else ""
+        act = f"/todos/{t['id']}"
         if t["done"]:
             return (f'<div class="todo"><div class="done">{who}{e(t["task"])}</div>'
-                    f'{self._form(f"/todos/{t["id"]}/reopen", "되돌리기", back)}</div>')
-        return (f'<div class="todo"><div>{who}{e(t["task"])} · {tag}{case}</div>'
-                f'{self._form(f"/todos/{t["id"]}/done", "완료", back)}</div>')
+                    f'{self._form(f"{act}/reopen", "되돌리기", back)}</div>')
+        mark = '<span class="badge">직접 고침</span>' if t["manual"] else ""
+        if t["suspect"]:
+            return (f'<div class="todo"><div>{who}{e(t["task"])} · {tag}{case}<span class="badge warn">완료 추정</span>'
+                    '<div class="muted small">다시 정리했더니 이 할 일이 더는 나오지 않았습니다. 끝난 일인지 확인해 주세요.</div></div>'
+                    f'<div>{self._form(f"{act}/done", "완료 맞음", back, True)} {self._form(f"{act}/keep", "아직 남음", back)}'
+                    "</div></div>")
+        return (f'<div class="todo"><div>{who}{e(t["task"])} · {tag}{case}{mark}</div><div>'
+                f'{self._form(f"{act}/done", "완료", back)} <a class="btn" href="{act}/edit?next={quote(back)}">수정</a>'
+                "</div></div>")
 
     def page_todos(self, q: dict, msg: str) -> str:
         today = date.today()
@@ -193,44 +226,190 @@ class Dashboard:
             if group:
                 body.append(f"<h2>{e(title)} · {len(group)}건</h2><div class=\"card\">"
                             + "".join(self._todo_row(t, "/todos", today) for t in group) + "</div>")
-        body.append('<p class="muted small">완료한 항목은 그 건의 화면에서 되돌릴 수 있습니다.</p>')
+        body.append('<p class="muted small">완료한 항목은 그 건의 화면에서 되돌릴 수 있습니다. '
+                    "할 일을 새로 더하려면 그 건을 여세요.</p>")
         return self._page("할 일", "todos", "".join(body), msg)
 
+    def _manual_badge(self, fields: list[str]) -> str:
+        if not fields:
+            return ""
+        names = ", ".join(views.FIELD_LABEL.get(f, f) for f in fields)
+        return f'<span class="badge" title="다시 정리해도 이 값은 바뀌지 않습니다">직접 고침: {e(names)}</span>'
+
     def page_case(self, cid: int, msg: str) -> str | None:
-        case = self.store.get_case(cid)
+        store, case = self.store, self.store.get_case(cid)
         if not case:
             return None
+        if case["deleted_at"]:
+            body = (f'<h1>#{cid} {e(case["title"])}<span class="badge">휴지통</span></h1><div class="card">이 건은 휴지통에 '
+                    f'있습니다. {self._form("/trash/restore", "되살리기", "/", True, {"kind": "case", "id": cid})}</div>')
+            return self._page(f"#{cid}", "trash", body, msg)
         back, today = f"/cases/{cid}", date.today()
-        recs = self.store.case_records(cid)
+        recs = store.case_records(cid)
         done = [r for r in recs if r["data"]]
-        state = '<span class="badge ok">진행 중</span>' if case["status"] == "open" else '<span class="badge">종결</span>'
-        body = [f'<p class="small"><a href="/">← 건 목록</a></p><h1>#{cid} {e(case["title"])}{state}</h1>'
-                f'<div class="muted small">기록 {len(recs)}건 · 최근 갱신 {_when(case["updated_at"])}</div>']
+        is_open = case["status"] == "open"
+        state = '<span class="badge ok">진행 중</span>' if is_open else '<span class="badge">종결</span>'
+        toggle = (self._form(f"/cases/{cid}/close", "종결", back) if is_open
+                  else self._form(f"/cases/{cid}/reopen", "다시 열기", back, True))
+        body = [f'<p class="small"><a href="/">← 건 목록</a></p><div class="row"><h1>#{cid} {e(case["title"])}{state}</h1>'
+                f'<div class="actions">{toggle} <a class="btn danger" href="/cases/{cid}/delete">삭제</a></div></div>'
+                f'<div class="muted small">기록 {len(recs)}건 · 최근 갱신 {_when(case["updated_at"])}'
+                + ("" if is_open else " · 종결하면서 완료 처리된 할 일은 다시 열면 되돌아옵니다") + "</div>"]
         if len(done) > 1:
             body.append("<h2>통합 정리</h2>")
             if case["data"] and not case["dirty"]:
-                body.append(f'<div class="card">{data_html(case["data"])}</div>')
+                body.append(f'<div class="card">{data_html(views.case_data(store, cid, case["data"]))}'
+                            f'<div class="actions"><a class="btn" href="/cases/{cid}/edit">수정</a>'
+                            f'{self._manual_badge(case["manual"])}</div></div>')
             else:
                 body.append('<div class="card"><div class="muted">기록이 바뀐 뒤로 통합 정리를 다시 만들지 않았습니다.</div><p>'
                             + self._form(f"/cases/{cid}/summary", "통합 정리 만들기 (LLM 1회 호출)", back, True) + "</p></div>")
-        todos = self.store.case_todos(cid)
-        if todos:
-            body.append(f'<h2>할 일</h2><div class="card">'
-                        + "".join(self._todo_row(t, back, today, show_case=False) for t in todos) + "</div>")
+        todos = store.case_todos(cid)
+        body.append('<h2>할 일</h2><div class="card">'
+                    + ("".join(self._todo_row(t, back, today, show_case=False) for t in todos)
+                       or '<div class="muted">할 일이 없습니다.</div>')
+                    + (f'<form method="post" action="/cases/{cid}/todos" class="actions fields">{self._hidden(back)}'
+                       '<input type="text" name="task" placeholder="할 일 더하기" required>'
+                       '<input type="text" name="owner" placeholder="담당 (비우면 나)">'
+                       '<input type="text" name="due" placeholder="기한 (예: 2026-11-20)">'
+                       "<button>더하기</button></form>" if done else "") + "</div>")
         body.append("<h2>기록</h2>")
+        others = [c for c in store.open_cases() if c["id"] != cid]
         for r in recs:
             head = f'<div class="muted small">{_when(r["created_at"])} · {e(_source(r))} · 기록 {r["id"]}</div>'
             if r["data"]:
-                asks = "".join(f"<li>{e(x)}</li>" for x in r["data"]["ask_user"])
+                d = views.record_data(store, r)
+                asks = "".join(f"<li>{e(x)}</li>" for x in d["ask_user"])
                 asks = (f'<div class="notice small">❓ 아직 답하지 않은 질문<ul>{asks}</ul>'
                         "슬랙의 그 스레드에 답글로 알려주면 반영됩니다.</div>") if asks else ""
-                inner = f'<h3>{e(r["data"]["title"])}</h3>{data_html(r["data"])}{asks}'
+                inner = f'<h3>{e(d["title"])}</h3>{data_html(d)}{asks}'
+                edit = f'<a class="btn" href="/records/{r["id"]}/edit">수정</a>'
             else:
                 inner = ('<div class="notice">아직 정리하지 않은 기록입니다. 원문은 이 PC에만 있습니다.</div>'
                          + self._form(f"/records/{r['id']}/summarize", "정리하기 (원문을 LLM으로 전송)", back, True))
+                edit = ""
+            options = ('<option value="new">새 건으로 떼어내기</option>' if len(recs) > 1 else "") + "".join(
+                f'<option value="{c["id"]}">#{c["id"]} {e(c["title"])}</option>' for c in others[:100])
+            move = (f'<form class="inline" method="post" action="/records/{r["id"]}/move">{self._hidden(back)}'
+                    f'<select name="target">{options}</select> <button>옮기기</button></form>') if options else ""
             raw = f'<details><summary>원문 보기</summary><pre>{e(r["raw_text"])}</pre></details>'
-            body.append(f'<div class="card">{head}{inner}{raw}</div>')
+            body.append(f'<div class="card">{head}{inner}<div class="actions">{edit}{move}'
+                        f'<a class="btn danger" href="/records/{r["id"]}/delete">삭제</a>'
+                        f'{self._manual_badge(r["manual"])}</div>{raw}</div>')
+        if done:
+            body.append(f'<h2>이 건에 메모 더하기</h2><form method="post" action="/cases/{cid}/note" class="card">'
+                        f'{self._hidden(back)}<textarea class="short" name="text" required '
+                        'placeholder="후속 내용을 적으면 새 기록으로 정리해 이 건에 붙입니다"></textarea>'
+                        '<div class="actions"><button class="primary">더하기 (LLM으로 전송)</button></div></form>')
         return self._page(f"#{cid} {case['title']}", "cases", "".join(body), msg)
+
+    def _edit_form(self, action: str, d: dict, back: str) -> str:
+        rows = []
+        for f in views.EDITABLE:
+            label = views.FIELD_LABEL[f]
+            if f in views.LIST_FIELDS:
+                rows.append(f'<div class="label">{label} <span class="muted small">(한 줄에 하나)</span></div>'
+                            f'<textarea class="short" name="{f}">{e(chr(10).join(d.get(f) or []))}</textarea>')
+            elif f == "conclusion":
+                rows.append(f'<div class="label">{label}</div><textarea class="short" name="{f}" required>'
+                            f'{e(d.get(f) or "")}</textarea>')
+            else:
+                req = " required" if f == "title" else ""
+                rows.append(f'<div class="label">{label}</div><input type="text" name="{f}" value="{e(d.get(f) or "")}"{req}>')
+        return (f'<form method="post" action="{e(action)}" class="card">{self._hidden(back)}{"".join(rows)}'
+                f'<div class="actions"><button class="primary">저장</button> <a class="btn" href="{e(back)}">취소</a></div></form>'
+                '<p class="muted small">고친 항목은 "직접 고침"으로 표시되고, 이후 다시 정리해도 바뀌지 않습니다. '
+                "할 일은 건 화면의 할 일 목록에서 고칩니다.</p>")
+
+    def page_edit(self, kind: str, target_id: int, msg: str) -> str | None:
+        """기록(record) 또는 건의 통합 정리(case)를 고치는 화면."""
+        if kind == "record":
+            rec = self.store.get_record(target_id)
+            if not rec or not rec["data"] or rec["deleted_at"]:
+                return None
+            back, d, manual, name = f"/cases/{rec['case_id']}", rec["data"], rec["manual"], f"기록 {target_id}"
+        else:
+            case = self.store.get_case(target_id)
+            if not case or not case["data"] or case["deleted_at"]:
+                return None
+            back, d, manual, name = f"/cases/{target_id}", case["data"], case["manual"], f"#{target_id} 통합 정리"
+        release = ""
+        if manual:
+            names = ", ".join(views.FIELD_LABEL.get(f, f) for f in manual)
+            release = (f'<div class="card"><div>직접 고친 항목: <b>{e(names)}</b></div><div class="muted small">표시를 지우면 '
+                       "다음에 다시 정리할 때 LLM이 뽑은 값으로 바뀔 수 있습니다. 지금 값은 그대로 둡니다.</div>"
+                       f'<div class="actions">{self._form(f"/{kind}s/{target_id}/release", "직접 고침 표시 지우기", back)}</div></div>')
+        body = (f'<p class="small"><a href="{back}">← 건으로</a></p><h1>{e(name)} 수정</h1>'
+                + self._edit_form(f"/{kind}s/{target_id}/edit", d, back) + release)
+        return self._page(f"{name} 수정", "cases", body, msg)
+
+    def page_todo_edit(self, tid: int, q: dict, msg: str) -> str | None:
+        t = self.store.get_todo(tid)
+        if not t or t["deleted_at"]:
+            return None
+        back = q.get("next", "") if q.get("next", "").startswith("/") and not q.get("next", "").startswith("//") else ""
+        back = back or f"/cases/{t['case_id']}"
+        body = (f'<p class="small"><a href="{e(back)}">← 돌아가기</a></p><h1>할 일 수정</h1>'
+                f'<form method="post" action="/todos/{tid}/edit" class="card">{self._hidden(back)}'
+                f'<div class="label">할 일</div><input type="text" name="task" value="{e(t["task"])}" required>'
+                f'<div class="label">담당 <span class="muted small">(비우면 나)</span></div>'
+                f'<input type="text" name="owner" value="{e(t["owner"] or "")}">'
+                f'<div class="label">기한 <span class="muted small">(YYYY-MM-DD로 적으면 기한이 지났는지 계산합니다)</span></div>'
+                f'<input type="text" name="due" value="{e(t["due"] or "")}">'
+                f'<div class="actions"><button class="primary">저장</button> <a class="btn" href="{e(back)}">취소</a></div></form>'
+                f'<div class="card"><div class="muted small">잘못 뽑힌 할 일이면 지울 수 있습니다. 휴지통에서 되살릴 수 있습니다.</div>'
+                f'<div class="actions">{self._form(f"/todos/{tid}/delete", "이 할 일 삭제", back, cls="danger")}</div></div>')
+        return self._page("할 일 수정", "todos", body, msg)
+
+    def page_delete(self, kind: str, target_id: int, msg: str) -> str | None:
+        """삭제 확인 화면. 스크립트 없이 한 번 더 묻는다."""
+        if kind == "case":
+            case = self.store.get_case(target_id)
+            if not case or case["deleted_at"]:
+                return None
+            n = len(self.store.case_records(target_id))
+            what, back = f"#{target_id} {case['title']} 건과 기록 {n}건", f"/cases/{target_id}"
+        else:
+            rec = self.store.get_record(target_id)
+            if not rec or rec["deleted_at"]:
+                return None
+            title = rec["data"]["title"] if rec["data"] else UNTITLED
+            what, back = f"기록 {target_id} ({title})", f"/cases/{rec['case_id']}"
+        body = (f'<h1>삭제할까요?</h1><div class="card"><div><b>{e(what)}</b>을(를) 휴지통으로 옮깁니다.</div>'
+                f'<div class="muted small">{TRASH_DAYS}일 안에는 휴지통에서 되살릴 수 있고, 그 뒤에는 완전히 지워집니다. '
+                "전사문 파일과 음성 파일은 지우지 않습니다.</div>"
+                f'<div class="actions">{self._form(f"/{kind}s/{target_id}/delete", "휴지통으로 옮기기", "/", cls="danger")} '
+                f'<a class="btn" href="{back}">취소</a></div></div>')
+        return self._page("삭제 확인", "cases", body, msg)
+
+    def page_trash(self, q: dict, msg: str) -> str:
+        store, now = self.store, datetime.now()
+
+        def left(ts: str) -> str:
+            days = TRASH_DAYS - (now - datetime.fromisoformat(ts)).days
+            return f"{max(days, 0)}일 뒤 완전히 지워짐"
+
+        def restore(kind: str, target_id: int) -> str:
+            return self._form("/trash/restore", "되살리기", "/trash", fields={"kind": kind, "id": target_id})
+
+        cases, recs, todos = store.deleted_cases(), store.deleted_records(), store.deleted_todos()
+        body = [f'<h1>휴지통</h1><p class="muted">지운 것은 {TRASH_DAYS}일 동안 여기 있다가 완전히 지워집니다.</p>']
+        if not cases and not recs and not todos:
+            body.append('<div class="card muted">휴지통이 비어 있습니다.</div>')
+        for title, rows, render in (
+            ("건", cases, lambda c: (f'#{c["id"]} {e(c["title"])} <span class="muted small">· 기록 {c["n_records"]}건</span>',
+                                    restore("case", c["id"]))),
+            ("기록", recs, lambda r: (f'기록 {r["id"]} · {e(r["data"]["title"] if r["data"] else UNTITLED)} '
+                                     f'<span class="muted small">· {e(_source(r))} · #{r["case_id"]}</span>',
+                                     restore("record", r["id"]))),
+            ("할 일", todos, lambda t: (f'{e(t["task"])} <span class="muted small">· #{t["case_id"]}</span>',
+                                       restore("todo", t["id"]))),
+        ):
+            if rows:
+                body.append(f'<h2>{title} {len(rows)}개</h2><div class="card">' + "".join(
+                    f'<div class="todo"><div>{render(x)[0]}<div class="muted small">{left(x["deleted_at"])}</div></div>'
+                    f"{render(x)[1]}</div>" for x in rows) + "</div>")
+        return self._page("휴지통", "trash", "".join(body), msg)
 
     def page_attention(self, q: dict, msg: str) -> str:
         store, back = self.store, "/attention"
@@ -325,11 +504,124 @@ class Dashboard:
             except Exception:
                 log.exception("슬랙 반영 실패(대시보드에는 반영됨)")
 
-    def act(self, path: str, form: dict) -> tuple[str, str]:
-        """POST 한 건을 처리하고 (돌아갈 주소, 알림 문구)를 돌려준다."""
+    def _sync_slack(self, *records: dict) -> None:
+        """대시보드에서 바뀐 기록의 슬랙 초안을 다시 그린다(지웠으면 지웠다고 표시)."""
+        if not self.bot:
+            return
+        for rec in records:
+            try:
+                self.bot.refresh_record(self.store.get_record(rec["id"]))
+            except Exception:
+                log.exception("슬랙 반영 실패(대시보드에는 반영됨)")
+
+    def _sync_case(self, cid: int) -> None:
+        self._sync_slack(*[r for r in self.store.case_records(cid) if r["data"]])
+
+    def act(self, path: str, form: dict) -> tuple:
+        """POST 한 건을 처리하고 (돌아갈 주소, 알림 문구[, 되돌리기 대상])를 돌려준다."""
         store, parts = self.store, [x for x in path.split("/") if x]
         back = form.get("next", "/")
         back = back if back.startswith("/") and not back.startswith("//") else "/"
+        num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+
+        if parts == ["trash", "restore"] and form.get("kind") in ("case", "record", "todo") and form.get("id", "").isdigit():
+            where = pipeline.restore(store, form["kind"], int(form["id"]))
+            if where.startswith("/cases/"):
+                self._sync_case(int(where.split("/")[2]))
+                return where, "되살렸습니다."
+            return "/trash", "되살릴 것을 찾지 못했습니다."
+
+        if num is not None and len(parts) == 3 and parts[0] in ("records", "cases") and parts[2] in ("edit", "release"):
+            kind = parts[0][:-1]
+            if parts[2] == "release":
+                pipeline.release(store, kind, num)
+                return back, "직접 고침 표시를 지웠습니다. 다음에 다시 정리하면 LLM 값으로 바뀔 수 있습니다."
+            try:
+                changed = (pipeline.edit_record if kind == "record" else pipeline.edit_case)(store, num, form)
+            except ValueError as err:
+                return back, str(err)
+            if not changed:
+                return back, "바뀐 내용이 없습니다."
+            if kind == "record":
+                self._sync_slack(store.get_record(num))
+            names = ", ".join(views.FIELD_LABEL[f] for f in changed)
+            return back, f"저장했습니다: {names}. 다시 정리해도 이 값은 유지됩니다."
+
+        if num is not None and parts[0] == "records" and parts[2:] == ["move"]:
+            rec, target = store.get_record(num), form.get("target", "")
+            if not rec or rec["deleted_at"]:
+                return back, "그 기록이 없습니다."
+            old = rec["case_id"]
+            try:
+                moved = pipeline.split(store, num) if target == "new" else pipeline.merge(store, num, int(target))
+            except (ValueError, pipeline.LLMError) as err:
+                return back, f"옮기지 못했습니다: {err}"
+            self._sync_case(moved["case_id"])
+            if store.get_case(old) and not store.get_case(old)["deleted_at"]:
+                self._sync_case(old)
+            what = "새 건으로 떼어냈습니다." if target == "new" else f"#{moved['case_id']} 건으로 옮겼습니다."
+            return f"/cases/{moved['case_id']}", f"기록 {num}을(를) {what}"
+
+        if num is not None and parts[0] == "records" and parts[2:] == ["delete"]:
+            rec = pipeline.delete(store, num)
+            if not rec:
+                return "/", "그 기록이 없습니다."
+            self._sync_slack(rec)
+            case = store.get_case(rec["case_id"])
+            where = f"/cases/{rec['case_id']}" if case and not case["deleted_at"] else "/"
+            return where, f"기록 {num}을(를) 휴지통으로 옮겼습니다.", f"record:{num}"
+
+        if num is not None and parts[0] == "cases" and len(parts) == 3:
+            case = store.get_case(num)
+            if not case or case["deleted_at"]:
+                return "/", "그 건이 없습니다."
+            if parts[2] == "delete":
+                recs = store.case_records(num)
+                pipeline.delete_case(store, num)
+                self._sync_slack(*recs)
+                return "/", f"#{num} 건을 휴지통으로 옮겼습니다.", f"case:{num}"
+            if parts[2] == "close":
+                pipeline.close(store, num)
+                return "/", f"#{num} 건을 종결했습니다. 종결한 건 보기에서 다시 열 수 있습니다."
+            if parts[2] == "reopen":
+                pipeline.reopen(store, num)
+                self._sync_case(num)
+                return f"/cases/{num}", "다시 열었습니다. 종결하면서 완료 처리됐던 할 일도 되돌렸습니다."
+            if parts[2] == "todos":
+                if not form.get("task", "").strip():
+                    return back, "할 일 내용이 비어 있습니다."
+                pipeline.add_todo(store, num, form["task"], form.get("owner"), form.get("due"))
+                self._sync_case(num)
+                return back, "할 일을 더했습니다."
+            if parts[2] == "note":
+                if not form.get("text", "").strip():
+                    return back, "메모가 비어 있습니다."
+                try:
+                    pipeline.add_note(store, num, form["text"].strip())
+                except pipeline.ProcessError as err:
+                    return back, f"원문은 이 건에 저장했지만 정리에 실패했습니다: {err}"
+                self._sync_case(num)
+                return back, "메모를 정리해 이 건에 붙였습니다."
+
+        if num is not None and parts[0] == "todos" and len(parts) == 3:
+            if parts[2] == "edit":
+                todo = store.get_todo(num)
+                if not todo:
+                    return back, "그 할 일이 없습니다."
+                if not form.get("task", "").strip():
+                    return back, "할 일 내용이 비어 있습니다."
+                changed = pipeline.edit_todo(store, num, form["task"], form.get("owner"), form.get("due"))
+                self._sync_case(todo["case_id"])
+                return back, "저장했습니다. 다시 정리해도 이 할 일은 유지됩니다." if changed else "바뀐 내용이 없습니다."
+            if parts[2] in ("done", "reopen", "keep", "delete"):
+                todo = pipeline.todo_action(store, num, parts[2])
+                if not todo:
+                    return back, "그 할 일이 없습니다."
+                self._sync_case(todo["case_id"])
+                text = {"done": "완료 처리했습니다.", "reopen": "다시 미완료로 돌렸습니다.",
+                        "keep": "남은 일로 두었습니다. 다시 완료로 추정하지 않습니다.",
+                        "delete": "할 일을 휴지통으로 옮겼습니다."}[parts[2]]
+                return (back, text, f"todo:{num}") if parts[2] == "delete" else (back, text)
 
         if parts == ["import"]:
             text = transcript.clean(form.get("text", ""))
@@ -343,14 +635,6 @@ class Dashboard:
                 self._show(rec)
                 return f"/cases/{rec['case_id']}", "전사문을 가져와 정리했습니다."
             return f"/cases/{rec['case_id']}", "전사문을 이 PC에 저장했습니다. 정리하려면 '정리하기'를 누르세요."
-
-        if len(parts) == 3 and parts[0] == "todos" and parts[1].isdigit():
-            if parts[2] == "done":
-                store.complete_todo(int(parts[1]))
-                return back, "완료 처리했습니다."
-            if parts[2] == "reopen":
-                store.reopen_todo(int(parts[1]))
-                return back, "다시 미완료로 돌렸습니다."
 
         if len(parts) == 3 and parts[0] == "records" and parts[1].isdigit() and parts[2] == "summarize":
             if not store.get_record(int(parts[1])):
@@ -440,13 +724,21 @@ class Dashboard:
                     return self._send(403, "이 PC에서만 열 수 있습니다.")
                 url = urlsplit(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
-                msg, parts = q.get("msg", ""), [x for x in url.path.split("/") if x]
+                msg, parts = Flash(q.get("msg", "")), [x for x in url.path.split("/") if x]
+                msg.undo = q.get("undo", "")
+                num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
                 try:
                     if not parts:
                         page = dash.page_cases(q, msg)
-                    elif parts[0] == "cases" and len(parts) == 2 and parts[1].isdigit():
-                        page = dash.page_case(int(parts[1]), msg)
-                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile"):
+                    elif parts[0] == "cases" and len(parts) == 2 and num is not None:
+                        page = dash.page_case(num, msg)
+                    elif num is not None and len(parts) == 3 and parts[0] in ("cases", "records") and parts[2] == "edit":
+                        page = dash.page_edit(parts[0][:-1], num, msg)
+                    elif num is not None and len(parts) == 3 and parts[0] in ("cases", "records") and parts[2] == "delete":
+                        page = dash.page_delete(parts[0][:-1], num, msg)
+                    elif num is not None and parts[0] == "todos" and parts[2:] == ["edit"]:
+                        page = dash.page_todo_edit(num, q, msg)
+                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile", "trash"):
                         page = getattr(dash, f"page_{parts[0]}")(q, msg)
                     else:
                         page = None
@@ -471,11 +763,12 @@ class Dashboard:
                     return self._send(403, dash._page("거절", "", '<div class="notice">이 화면이 오래됐습니다(두괄이가 '
                                                       '다시 켜졌을 수 있습니다). <a href="/">새로 열어</a> 다시 해 주세요.</div>'))
                 try:
-                    back, msg = dash.act(urlsplit(self.path).path, form)
+                    back, msg, *undo = dash.act(urlsplit(self.path).path, form)
                 except Exception as err:
                     log.exception("대시보드 요청 처리 오류: %s", self.path)
-                    back, msg = "/", f"처리하다 오류가 났습니다: {err}"
+                    back, msg, undo = "/", f"처리하다 오류가 났습니다: {err}", []
                 sep = "&" if "?" in back else "?"
-                self._send(303, location=f"{back}{sep}msg={quote(msg)}" if msg else back)
+                extra = f"&undo={quote(undo[0])}" if undo else ""
+                self._send(303, location=f"{back}{sep}msg={quote(msg)}{extra}" if msg else back)
 
         return Handler

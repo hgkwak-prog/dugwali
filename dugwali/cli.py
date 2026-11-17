@@ -17,7 +17,7 @@
 import argparse
 import sys
 
-from . import digest, pipeline, profile
+from . import digest, pipeline, profile, views
 from .agent import llm, render
 from .config import cfg
 from .store import Store
@@ -71,14 +71,16 @@ def main(argv: list[str] | None = None) -> int:
             ids = ", ".join(str(r["id"]) for r in store.case_records(c["id"]))
             print(f"#{c['id']} {c['title']} · 기록 {c['n_records']}건(번호 {ids}) · 할 일 {c['n_todos']}건")
     elif args.cmd == "case":
-        data = pipeline.case_summary(Store(cfg.db_path), args.case_id)
-        print(render.slack(data) if data else "정리할 기록이 없습니다.")
+        store = Store(cfg.db_path)
+        data = pipeline.case_summary(store, args.case_id)
+        print(render.slack(views.case_data(store, args.case_id, data)) if data else "정리할 기록이 없습니다.")
     elif args.cmd == "merge":
         rec = pipeline.merge(Store(cfg.db_path), args.record_id, args.case_id)
         print(f"기록 {rec['id']} → 건 #{rec['case_id']}")
     elif args.cmd == "delete":
         rec = pipeline.delete(Store(cfg.db_path), args.record_id)
-        print(f"기록 {args.record_id} 삭제" if rec else "그런 기록이 없습니다.")
+        print(f"기록 {args.record_id}을(를) 휴지통으로 옮겼습니다(대시보드 휴지통에서 되살릴 수 있음)." if rec
+              else "그런 기록이 없습니다.")
     elif args.cmd == "profile":
         if args.init:
             try:
@@ -125,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"정리 실패: {e}\n원문은 기록 {e.record['id']}로 저장했습니다. "
                   f"다시 시도: python -m dugwali.cli retry {e.record['id']}")
             return 1
-        d = rec["data"]
+        d = views.record_data(store, rec)
         for label, fn in (("슬랙", render.slack), ("메일", render.mail), ("구두 보고", render.verbal)):
             print(f"\n===== {label} =====\n{fn(d)}")
         if d["ask_user"]:

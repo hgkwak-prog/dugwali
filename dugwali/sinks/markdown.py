@@ -5,6 +5,7 @@
 """
 import re
 
+from .. import views
 from ..agent import render
 from ..config import cfg
 from ..labels import SOURCE_LABEL
@@ -26,7 +27,7 @@ def rewrite_day(store, day: str) -> str:
     body = [f"# {day} 업무 로그", ""]
     for r in recs:
         body.append(render.markdown(
-            r["data"], r["created_at"][11:16], SOURCE_LABEL.get(r["source"], r["source"]),
+            views.record_data(store, r), r["created_at"][11:16], SOURCE_LABEL.get(r["source"], r["source"]),
             case_label(store.get_case(r["case_id"]))))
     path.write_text("\n".join(body), encoding="utf-8")
     return str(path)
@@ -39,7 +40,7 @@ def rewrite_case(store, cid: int) -> str | None:
     for old in folder.glob(f"{cid:03d}-*.md"):  # 제목이 바뀌면 파일명도 바뀌므로 먼저 지운다
         old.unlink()
     case = store.get_case(cid)
-    if not case:
+    if not case or case["deleted_at"]:
         return None
     recs = [r for r in store.case_records(cid) if r["data"]]
     if not recs:
@@ -48,11 +49,11 @@ def rewrite_case(store, cid: int) -> str | None:
     state = "진행 중" if case["status"] == "open" else "종결"
     body = [f"# #{cid} {case['title']}", "", f"상태: {state} / 기록 {len(recs)}건", ""]
     if len(recs) > 1 and case["data"] and not case["dirty"]:
-        body.append(render.markdown(case["data"], "통합 정리", f"기록 {len(recs)}건 종합"))
+        body.append(render.markdown(views.case_data(store, cid, case["data"]), "통합 정리", f"기록 {len(recs)}건 종합"))
     body += ["## 기록", ""]
     for r in recs:
         body.append(render.markdown(
-            r["data"], r["created_at"][:16].replace("T", " "),
+            views.record_data(store, r), r["created_at"][:16].replace("T", " "),
             SOURCE_LABEL.get(r["source"], r["source"]), level=3))
     path = folder / f"{cid:03d}-{slug}.md"
     path.write_text("\n".join(body), encoding="utf-8")

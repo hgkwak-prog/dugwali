@@ -13,7 +13,7 @@ from pathlib import Path
 
 from slack_bolt import App
 
-from .. import digest, pipeline, profile
+from .. import digest, pipeline, profile, views
 from ..agent import render
 from ..config import cfg
 from ..labels import SOURCE_LABEL
@@ -67,7 +67,7 @@ def _context(text: str) -> dict:
 
 
 def record_blocks(store: Store, rec: dict) -> list[dict]:
-    d, rid = rec["data"], str(rec["id"])
+    d, rid = views.record_data(store, rec), str(rec["id"])
     case = store.get_case(rec["case_id"])
     others = [c for c in store.open_cases() if c["id"] != rec["case_id"]]
     blocks = [_section(render.slack(d))]
@@ -96,7 +96,8 @@ def record_blocks(store: Store, rec: dict) -> list[dict]:
             "options": [{"text": _plain(f"#{c['id']} {c['title']}"), "value": f"{rid}:{c['id']}"}
                         for c in others[:100]],
         })
-    manage.append(_button("삭제", "delete_record", rid, "danger", "이 기록과 여기서 나온 할 일을 지웁니다."))
+    manage.append(_button("삭제", "delete_record", rid, "danger",
+                          "이 기록을 휴지통으로 옮깁니다. 30일 안에 대시보드에서 되살릴 수 있습니다."))
     blocks.append({"type": "actions", "elements": manage})
     return blocks
 
@@ -124,7 +125,7 @@ def case_list_blocks(store: Store) -> list[dict]:
             _button("정리 보기", "case_view", cid),
             _button("종결", "case_close", cid),
             _button("삭제", "case_delete", cid, "danger",
-                    f"#{cid} 건의 기록 {c['n_records']}건과 할 일을 모두 지웁니다."),
+                    f"#{cid} 건의 기록 {c['n_records']}건을 휴지통으로 옮깁니다. 30일 안에 되살릴 수 있습니다."),
         ]})
     if len(cases) > MAX_CASES_LISTED:
         blocks.append(_context(f"최근 {MAX_CASES_LISTED}개만 표시했습니다. 끝난 건은 종결하면 목록에서 빠집니다."))
@@ -139,7 +140,7 @@ def case_view_blocks(store: Store, cid: int, data: dict) -> list[dict]:
         lines.append(f"{r['created_at'][5:16].replace('T', ' ')} {title}")
     key = f"c{cid}"
     return [
-        _section(render.slack(data)),
+        _section(render.slack(views.case_data(store, cid, data))),
         _context(f"건 *#{cid}* · 기록 {len(recs)}건\n" + "\n".join(f"• {x}" for x in lines)),
         {"type": "actions", "elements": [
             _button("슬랙 공유용", "fmt_slack", key),
@@ -309,6 +310,16 @@ class Bot:
     def show_record(self, rec: dict) -> None:
         """슬랙 밖(대시보드)에서 정리한 기록을 슬랙에도 반영한다."""
         self._show(self.app.client, rec)
+
+    def refresh_record(self, rec: dict) -> None:
+        """슬랙 밖(대시보드)에서 바뀐 기록의 초안을 다시 그린다. 초안이 올라간 적 없으면 아무것도 하지 않는다."""
+        if not (rec.get("channel") and rec.get("msg_ts")):
+            return
+        if rec.get("deleted_at"):
+            self.app.client.chat_update(channel=rec["channel"], ts=rec["msg_ts"], blocks=[],
+                                        text="🗑 휴지통으로 옮겼습니다(대시보드). 30일 안에 되살릴 수 있습니다.")
+        else:
+            self._redraw(self.app.client, rec)
 
     def _voice(self, client, rid: int, provider: str | None = None) -> dict | None:
         """음성 메모 기록을 받아써서 정리한다. 막히면 실패 항목을 남기고 돌려준다(성공하면 None).
@@ -491,9 +502,10 @@ class Bot:
                 value = body["actions"][0]["value"]
                 if value.startswith("c"):  # 건 통합 정리(이미 계산돼 캐시된 결과)
                     data = pipeline.case_summary(store, int(value[1:]))
+                    data = views.case_data(store, int(value[1:]), data) if data else None
                 else:
                     rec = store.get_record(int(value))
-                    data = rec["data"] if rec else None
+                    data = views.record_data(store, rec) if rec else None
                 if not data:
                     return
                 msg = body["message"]
@@ -557,7 +569,7 @@ class Bot:
             ack()
             pipeline.delete(store, int(body["actions"][0]["value"]))
             client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"],
-                               text="🗑 삭제했습니다.", blocks=[])
+                               text="🗑 휴지통으로 옮겼습니다. 30일 안에 대시보드 휴지통에서 되살릴 수 있습니다.", blocks=[])
 
         @app.action("case_view")
         def on_case_view(ack, body, client):

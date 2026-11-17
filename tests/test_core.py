@@ -786,7 +786,7 @@ def test_dismissing_untranscribed_voice_memo_drops_the_empty_record(bot, store, 
     voice["send"]()
     assert "retry_failure_local" not in bot.app.client.actions("1.0")       # 로컬 방식이면 버튼이 하나뿐
     bot.click("dismiss_failure", "1.0")
-    assert store.get_record(1) is None and digest.attention(store) == ([], [])
+    assert store.get_record(1)["deleted_at"] and digest.attention(store) == ([], [])
     assert "음성 파일은 그대로" in bot.app.client.messages["1.0"]["text"]
 
 
@@ -1030,3 +1030,247 @@ def test_slack_dashboard_command(bot):
     bot.dashboard_url = "http://127.0.0.1:8765/"
     bot.say("대시보드", ts="101.0")
     assert "http://127.0.0.1:8765/" in bot.app.client.messages["2.0"]["text"]
+
+
+# ---------- 사람이 고친 값 보호, 완료 추정, 휴지통 ----------
+
+@pytest.fixture
+def llm_out(monkeypatch):
+    """LLM이 다음에 돌려줄 내용을 테스트가 정한다. state["prompts"]에 보낸 프롬프트가 쌓인다."""
+    state = {"data": dict(SAMPLE), "prompts": []}
+
+    def fake(prompt):
+        state["prompts"].append(prompt)
+        return dict(state["data"])
+
+    monkeypatch.setattr(llm, "call_json", fake)
+    return state
+
+
+def test_manual_todo_edit_survives_reextraction(store, llm_out):
+    from dugwali import views
+
+    rec = pipeline.process(store, "메모")
+    mine = next(t for t in store.open_todos() if t["owner"] == "나")
+    assert pipeline.edit_todo(store, mine["id"], "수정 견적서 작성", "나", "2026-11-25")
+    llm_out["data"] = {**SAMPLE, "todos": [{"task": "수정 견적서 작성", "owner": "나", "due": "2026-11-20"},
+                                           {"task": "납기 가능일 회신", "owner": "A사 김과장", "due": "2026-11-21"}]}
+    rec = pipeline.amend(store, rec["id"], "기한은 그대로")       # 슬랙 답글로 다시 정리
+    todos = {t["task"]: t for t in store.open_todos()}
+    assert todos["수정 견적서 작성"]["due"] == "2026-11-25" and todos["수정 견적서 작성"]["manual"] == 1   # 사람이 고친 값 유지
+    assert todos["납기 가능일 회신"]["due"] == "2026-11-21"         # 고치지 않은 것은 LLM 값을 따른다
+    assert "[지금 열려 있는 할 일 - 같은 일이면 이 문구를 그대로 쓸 것]" in llm_out["prompts"][-1]
+    shown = views.record_data(store, rec)["todos"]                   # 슬랙 초안·메일·로그가 쓰는 값
+    assert {"task": "수정 견적서 작성", "owner": "나", "due": "2026-11-25"} in shown
+    assert "2026-11-25" in (cfg.log_dir / f"{rec['created_at'][:10]}.md").read_text(encoding="utf-8")
+    fields = [(c["target"], c["field"], c["before"], c["after"]) for c in store.corrections()]
+    assert ("todo", "due", "2026-11-20", "2026-11-25") in fields
+
+
+def test_todo_dropped_by_llm_becomes_suspect_not_deleted(store, llm_out):
+    rec = pipeline.process(store, "메모")
+    added = pipeline.add_todo(store, rec["case_id"], "계약서 초안 검토", None, "2026-11-30")
+    llm_out["data"] = {**SAMPLE, "todos": [{"task": "납기  가능일 회신.", "owner": "A사 김과장", "due": None}]}
+    pipeline.amend(store, rec["id"], "견적서는 이미 보냄")
+    todos = {t["task"]: t for t in store.open_todos()}
+    assert set(todos) == {"수정 견적서 작성", "납기  가능일 회신.", "계약서 초안 검토"}   # 문장부호 차이는 같은 일
+    assert todos["수정 견적서 작성"]["suspect"] == 1                 # 지우지 않고 완료 추정으로 표시
+    assert todos["계약서 초안 검토"]["suspect"] == 0 and todos["계약서 초안 검토"]["id"] == added   # 사람이 더한 것은 그대로
+    assert "수정 견적서 작성 · " in digest.build(store) and "완료 추정(확인 필요)" in digest.build(store)
+
+    suspect = todos["수정 견적서 작성"]["id"]
+    pipeline.todo_action(store, suspect, "keep")                     # "아직 남음"
+    pipeline.amend(store, rec["id"], "또 보충")
+    t = store.get_todo(suspect)
+    assert t["suspect"] == 0 and t["manual"] == 1 and not t["done"]  # 다시 추정하지 않는다
+
+    pipeline.todo_action(store, added, "delete")
+    llm_out["data"] = {**SAMPLE, "todos": [{"task": "계약서 초안 검토", "owner": "나", "due": None}]}
+    pipeline.amend(store, rec["id"], "보충")
+    assert "계약서 초안 검토" not in [t["task"] for t in store.open_todos()]   # 지운 일은 LLM이 다시 뽑아도 되살리지 않는다
+    assert [t["task"] for t in store.deleted_todos()] == ["계약서 초안 검토"]
+
+
+def test_manual_record_field_survives_until_released(store, llm_out):
+    rec = pipeline.process(store, "메모")
+    changed = pipeline.edit_record(store, rec["id"], {"conclusion": "A사가 금요일까지 견적서를 원함 (부가세 별도)",
+                                                     "decisions": "단가는 기존 유지\n수량만 200개로 변경\n", "title": " "})
+    assert changed == ["conclusion"] and store.get_record(rec["id"])["manual"] == ["conclusion"]   # 안 바뀐 것은 표시하지 않는다
+    llm_out["data"] = {**SAMPLE, "conclusion": "LLM이 다시 쓴 결론", "decisions": ["새 결정"]}
+    rec = pipeline.amend(store, rec["id"], "보충")
+    assert rec["data"]["conclusion"].endswith("(부가세 별도)") and rec["data"]["decisions"] == ["새 결정"]
+    pipeline.release(store, "record", rec["id"])
+    assert pipeline.amend(store, rec["id"], "보충")["data"]["conclusion"] == "LLM이 다시 쓴 결론"
+
+
+def test_manual_case_summary_field_survives_resummary(store, llm_out):
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    pipeline.merge(store, b["id"], a["case_id"])
+    assert pipeline.edit_case(store, a["case_id"], {"title": "A사 견적 건"}) == ["title"]
+    assert store.get_case(a["case_id"])["title"] == "A사 견적 건" and not store.get_case(a["case_id"])["dirty"]
+    pipeline.amend(store, a["id"], "보충")                            # 통합 정리를 다시 만든다
+    case = store.get_case(a["case_id"])
+    assert case["title"] == "A사 견적 건" and case["manual"] == ["title"] and not case["dirty"]
+
+
+def test_delete_goes_to_trash_and_restores(store, llm_out):
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    pipeline.merge(store, b["id"], a["case_id"])
+    cid, day = a["case_id"], cfg.log_dir / f"{a['created_at'][:10]}.md"
+    assert len(store.open_todos()) == 2
+    pipeline.delete(store, b["id"])                                   # 할 일이 붙어 있던 최근 기록을 지워도
+    assert len(store.open_todos()) == 2 and store.get_record(b["id"])["deleted_at"]   # 건의 할 일은 남는다
+    assert [r["id"] for r in store.deleted_records()] == [b["id"]] and day.read_text(encoding="utf-8").count("## ") == 1
+    assert store.find_by_thread("C", "1") is None
+
+    pipeline.delete_case(store, cid)
+    assert store.open_cases() == [] and store.open_todos() == [] and not day.exists()
+    assert [c["id"] for c in store.deleted_cases()] == [cid] and store.deleted_cases()[0]["n_records"] == 1
+    assert pipeline.restore(store, "case", cid) == f"/cases/{cid}"
+    assert [r["id"] for r in store.case_records(cid)] == [a["id"]]    # 건과 함께 지운 기록만 돌아온다
+    assert len(store.open_todos()) == 2 and day.exists()
+    assert pipeline.restore(store, "record", b["id"]) == f"/cases/{cid}" and len(store.case_records(cid)) == 2
+
+    c = pipeline.process(store, "혼자 있는 기록")
+    pipeline.delete(store, c["id"])                                   # 기록이 하나뿐인 건은 건째로 휴지통에
+    assert [x["id"] for x in store.deleted_cases()] == [c["case_id"]] and store.deleted_records() == []
+    pipeline.restore(store, "record", c["id"])
+    assert store.get_case(c["case_id"])["deleted_at"] is None
+
+
+def test_trash_is_purged_after_30_days(store, llm_out):
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    pipeline.delete(store, a["id"])
+    pipeline.delete(store, b["id"])
+    old = "2026-01-01T00:00:00"
+    store._db.execute("UPDATE records SET deleted_at=? WHERE id=?", (old, a["id"]))
+    store._db.execute("UPDATE cases SET deleted_at=? WHERE id=?", (old, a["case_id"]))
+    store._db.commit()
+    assert app.purge_tick(store, datetime(2026, 11, 17, 9, 0)) == 1
+    assert store.get_record(a["id"]) is None and store.get_case(a["case_id"]) is None
+    assert store.get_record(b["id"])["deleted_at"]                    # 30일이 안 된 것은 남는다
+    assert app.purge_tick(store, datetime(2026, 11, 17, 18, 0)) == 0  # 하루 한 번만
+
+
+def test_close_is_undone_by_reopen(store, llm_out):
+    a = pipeline.process(store, "메모")
+    mine = next(t for t in store.open_todos() if t["owner"] == "나")
+    store.complete_todo(mine["id"])
+    pipeline.close(store, a["case_id"])
+    assert store.open_todos() == []
+    pipeline.reopen(store, a["case_id"])
+    assert [t["task"] for t in store.open_todos()] == ["납기 가능일 회신"]   # 종결 전에 끝낸 일은 끝난 채로 둔다
+    assert [c["id"] for c in store.open_cases()] == [a["case_id"]]
+
+
+def test_split_and_add_note(store, llm_out):
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    pipeline.merge(store, b["id"], a["case_id"])
+    moved = pipeline.split(store, b["id"])
+    assert moved["case_id"] != a["case_id"] and len(store.open_cases()) == 2
+    assert len(store.case_records(a["case_id"])) == 1
+    note = pipeline.add_note(store, a["case_id"], "후속: 견적서 보냄")
+    assert note["case_id"] == a["case_id"] and note["source"] == "web" and len(store.case_records(a["case_id"])) == 2
+    assert not store.get_case(a["case_id"])["dirty"]                  # 통합 정리까지 다시 만든다
+
+
+def test_old_db_gains_new_columns_without_losing_todos(tmp_path):
+    path = tmp_path / "v1.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE cases (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+            data TEXT, dirty INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE records (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, source TEXT NOT NULL,
+            raw_text TEXT NOT NULL, data TEXT, channel TEXT, thread_ts TEXT, msg_ts TEXT, audio_path TEXT, case_id INTEGER);
+        CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id INTEGER NOT NULL, task TEXT NOT NULL,
+            owner TEXT, due TEXT, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        INSERT INTO cases (title, created_at, updated_at) VALUES ('옛 건', '2026-11-13T10:00:00', '2026-11-13T10:00:00');
+        INSERT INTO records (created_at, source, raw_text, data, case_id) VALUES
+            ('2026-11-13T10:00:00', 'slack', 'a', '{"title": "옛 건", "todos": []}', 1);
+        INSERT INTO todos (record_id, task, owner, due, created_at) VALUES (1, '옛 할 일', '나', NULL, '2026-11-13T10:00:00');
+    """)
+    db.commit()
+    db.close()
+    store = Store(path)
+    (t,) = store.open_todos()
+    assert t["task"] == "옛 할 일" and t["manual"] == 0 and t["suspect"] == 0 and t["deleted_at"] is None
+    assert store.get_record(1)["manual"] == [] and store.open_cases()[0]["n_todos"] == 1
+
+
+def test_dashboard_edit_delete_undo_and_trash(dash, store, llm_out):
+    import re as _re
+
+    a = pipeline.process(store, "메모")
+    cid, rid = a["case_id"], a["id"]
+    _, html = dash.get(f"/records/{rid}/edit")
+    assert 'name="conclusion"' in html and "단가는 기존 유지\n수량만 200개로 변경" in html
+    _, html = dash.post(f"/records/{rid}/edit", next=f"/cases/{cid}", conclusion="고친 결론", title="견적서 재요청",
+                        decisions="단가는 기존 유지\n수량만 200개로 변경", open_questions="부가세 포함 여부",
+                        background="지난주 견적은 100개 기준", counterpart="A사 김과장", share_to="박팀장")
+    assert "저장했습니다: 결론." in html and "고친 결론" in html and "직접 고침: 결론" in html
+
+    tid = next(t["id"] for t in store.open_todos() if t["owner"] == "나")
+    assert 'value="2026-11-20"' in dash.get(f"/todos/{tid}/edit")[1]
+    _, html = dash.post(f"/todos/{tid}/edit", next=f"/cases/{cid}", task="수정 견적서 작성", owner="나", due="2026-11-25")
+    assert "다시 정리해도 이 할 일은 유지됩니다" in html and "직접 고침</span>" in html
+    _, html = dash.post(f"/cases/{cid}/todos", next=f"/cases/{cid}", task="계약서 검토", owner="", due="")
+    assert "할 일을 더했습니다." in html and len(store.open_todos()) == 3
+    pipeline.amend(store, rid, "슬랙 답글")                            # 고친 기한이 슬랙 답글 뒤에도 유지된다
+    assert store.get_todo(tid)["due"] == "2026-11-25" and store.get_record(rid)["data"]["conclusion"] == "고친 결론"
+
+    assert "휴지통으로 옮깁니다" in dash.get(f"/cases/{cid}/delete")[1] and store.open_cases()     # 확인 화면은 지우지 않는다
+    status, loc = dash.post(f"/cases/{cid}/delete", follow=False)
+    assert status == 303 and "undo=case%3A1" in loc and store.open_cases() == []
+    _, html = dash.get(loc)
+    assert "휴지통으로 옮겼습니다." in html and "되돌리기" in html and 'name="kind" value="case"' in html
+    _, html = dash.get("/trash")
+    assert "#1 견적서 재요청" in html and "30일 뒤 완전히 지워짐" in html
+    _, html = dash.post("/trash/restore", kind="case", id=str(cid))
+    assert "되살렸습니다." in html and len(store.open_todos()) == 3
+    assert "undo=" not in _re.sub(r"<[^>]+>", "", html)
+
+    assert "<script>" not in dash.get("/?msg=x&undo=%3Cscript%3E")[1]    # 되돌리기 대상은 형식이 맞을 때만 쓴다
+    _, html = dash.post(f"/cases/{cid}/close")
+    assert "종결했습니다" in html and store.open_cases() == []
+    _, html = dash.post(f"/cases/{cid}/reopen")
+    assert "다시 열었습니다" in html and len(store.open_todos()) == 3
+
+
+def test_dashboard_move_split_note_and_suspect(dash, store, llm_out):
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    _, html = dash.post(f"/records/{b['id']}/move", target=str(a["case_id"]))
+    assert f"#{a['case_id']} 건으로 옮겼습니다" in html and len(store.case_records(a["case_id"])) == 2
+    _, html = dash.post(f"/records/{b['id']}/move", target="new")
+    assert "새 건으로 떼어냈습니다" in html and len(store.open_cases()) == 2
+    _, html = dash.post(f"/cases/{a['case_id']}/note", next=f"/cases/{a['case_id']}", text="후속 메모")
+    assert "메모를 정리해 이 건에 붙였습니다." in html and len(store.case_records(a["case_id"])) == 2
+
+    llm_out["data"] = {**SAMPLE, "todos": []}
+    pipeline.amend(store, b["id"], "다 끝남")
+    bcase = store.get_record(b["id"])["case_id"]
+    _, html = dash.get(f"/cases/{bcase}")
+    assert "완료 추정" in html and "완료 맞음" in html and "아직 남음" in html
+    suspects = [t["id"] for t in store.case_todos(bcase) if t["suspect"]]
+    dash.post(f"/todos/{suspects[0]}/done")
+    dash.post(f"/todos/{suspects[1]}/keep")
+    assert sorted((t["done"], t["suspect"], t["manual"]) for t in store.case_todos(bcase)) == [(0, 0, 1), (1, 0, 0)]
+    status, loc = dash.post(f"/records/{b['id']}/delete", follow=False)
+    assert "undo=record%3A2" in loc and store.get_record(b["id"])["deleted_at"]
+
+
+def test_slack_draft_follows_dashboard_edits(bot, store, llm_out):
+    bot.say("메모")
+    client, rec = bot.app.client, store.get_record(1)
+    d = Dashboard(store, bot, port=0)
+    tid = next(t["id"] for t in store.open_todos() if t["owner"] == "나")
+    d.act(f"/todos/{tid}/edit", {"task": "수정 견적서 작성", "owner": "나", "due": "2026-11-25", "next": "/"})
+    text = client.messages["1.0"]["blocks"][0]["text"]["text"]
+    assert "수정 견적서 작성 (나, 2026-11-25까지)" in text            # 슬랙 초안도 고친 기한을 보여준다
+    d.act(f"/todos/{tid}/done", {"next": "/"})
+    assert "수정 견적서 작성" not in client.messages["1.0"]["blocks"][0]["text"]["text"]
+    d.act(f"/records/{rec['id']}/delete", {})
+    assert "휴지통으로 옮겼습니다" in client.messages["1.0"]["text"] and client.messages["1.0"]["blocks"] == []
+    d.act("/trash/restore", {"kind": "record", "id": "1"})
+    assert "fmt_slack" in client.actions("1.0")                       # 되살리면 초안도 돌아온다
+    bot.click("delete_record", "1.0")
+    assert store.get_record(1)["deleted_at"] and "되살릴 수 있습니다" in client.messages["1.0"]["text"]

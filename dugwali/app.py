@@ -104,10 +104,23 @@ def digest_tick(bot, store: Store, now: datetime) -> None:
     store.resolve_failures(stage="digest", target=today)
 
 
+def purge_tick(store: Store, now: datetime) -> int:
+    """휴지통에 30일 넘게 있던 것을 하루 한 번 실제로 지운다. 지운 기록 수를 돌려준다."""
+    today = now.date().isoformat()
+    if store.get_state("trash_purged_on") == today:
+        return 0
+    n = store.purge_trash()
+    store.set_state("trash_purged_on", today)
+    if n:
+        log.info("휴지통에서 오래된 기록 %d건을 완전히 지웠습니다", n)
+    return n
+
+
 def digest_loop(bot, store: Store) -> None:
     while True:
         try:
             digest_tick(bot, store, datetime.now())
+            purge_tick(store, datetime.now())
         except Exception:
             log.exception("다이제스트 점검 실패")
         time.sleep(30)

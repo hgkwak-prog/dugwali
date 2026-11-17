@@ -29,7 +29,8 @@ def due_tag(due: str | None, today: date) -> str:
 
 def todo_text(t: dict, today: date) -> str:
     who = "" if t.get("owner") in (None, "나") else f"{t['owner']}: "
-    return f"{who}{t['task']} · {due_tag(t['due'], today)}"
+    suspect = " · 완료 추정(확인 필요)" if t.get("suspect") else ""
+    return f"{who}{t['task']} · {due_tag(t['due'], today)}{suspect}"
 
 
 def is_mine(t: dict) -> bool:
