@@ -7,6 +7,8 @@
   python -m dugwali.cli case 3                   # 3번 건 통합 정리
   python -m dugwali.cli merge 5 3                # 5번 기록을 3번 건에 합치기
   python -m dugwali.cli delete 5                 # 5번 기록 삭제
+  python -m dugwali.cli attention                # 처리 실패, 정리 안 된 기록
+  python -m dugwali.cli retry 5                  # 5번 기록을 다시 정리
   python -m dugwali.cli check                    # claude 헤드리스 호출 점검
 """
 import argparse
@@ -36,6 +38,9 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("case_id", type=int)
     d_ = sub.add_parser("delete", help="기록 삭제")
     d_.add_argument("record_id", type=int)
+    sub.add_parser("attention", help="처리 실패와 정리 안 된 기록")
+    r_ = sub.add_parser("retry", help="정리에 실패했거나 보관만 한 기록을 다시 정리")
+    r_.add_argument("record_id", type=int)
     args = p.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -67,8 +72,28 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "delete":
         rec = pipeline.delete(Store(cfg.db_path), args.record_id)
         print(f"기록 {args.record_id} 삭제" if rec else "그런 기록이 없습니다.")
+    elif args.cmd == "attention":
+        failures, pending = digest.attention(Store(cfg.db_path))
+        for f in failures:
+            print(f"실패 {f['id']} [{f['stage']}] {f['target']} · 시도 {f['attempts']}회 · {f['error']}")
+        for r in pending:
+            print(f"정리 안 된 기록 {r['id']} · {r['created_at'][:16]} · {r['source']}")
+        if not failures and not pending:
+            print("조치할 것이 없습니다.")
     else:
-        rec = pipeline.process(Store(cfg.db_path), args.text, "cli")
+        store = Store(cfg.db_path)
+        try:
+            if args.cmd == "retry":
+                if not store.get_record(args.record_id):
+                    print("그런 기록이 없습니다.")
+                    return 1
+                rec = pipeline.summarize(store, args.record_id)
+            else:
+                rec = pipeline.process(store, args.text, "cli")
+        except pipeline.ProcessError as e:
+            print(f"정리 실패: {e}\n원문은 기록 {e.record['id']}로 저장했습니다. "
+                  f"다시 시도: python -m dugwali.cli retry {e.record['id']}")
+            return 1
         d = rec["data"]
         for label, fn in (("슬랙", render.slack), ("메일", render.mail), ("구두 보고", render.verbal)):
             print(f"\n===== {label} =====\n{fn(d)}")

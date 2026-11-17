@@ -1,9 +1,10 @@
 """진입점: 슬랙 봇 + 통화 녹음 감시 + 일일 다이제스트.  실행: python -m dugwali.app"""
+import json
 import logging
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -15,8 +16,21 @@ from .store import Store
 log = logging.getLogger("dugwali")
 
 
-def handle_call(bot, store: Store, path: Path) -> None:
+DIGEST_RETRIES = 3       # 마감 정리 전송을 하루에 이만큼까지 시도한다
+DIGEST_RETRY_MIN = 10    # 실패하면 이만큼 기다렸다가 다시 시도한다
+_call_lock = threading.Lock()  # 전사는 무겁다: 감시·다시 시도·놓친 녹음 처리가 겹치지 않게 한다
+
+
+def _process_call(bot, store: Store, path: Path) -> None:
     """통화 녹음 1건: 전사 → 전사문 저장 → (설정에 따라) 요약 또는 보관 후 버튼 제시."""
+    rec = store.find_by_audio(str(path))
+    if rec:  # 기록까지는 만들어졌던 파일(슬랙 전송만 실패): 다시 전사하지 않고 올리기만 한다
+        if rec["data"]:
+            bot.post_record(rec, prefix=f"📞 통화 다시 올림: `{path.name}`")
+        elif not store.record_has_failure(rec["id"]):
+            bot.post_held_call(rec, f"📞 통화 전사 완료: `{path.name}`\n전사문은 로컬에만 저장했습니다.")
+        return
+
     from .stt.transcribe import transcribe
 
     result = transcribe(str(path), speakers=2)
@@ -34,17 +48,65 @@ def handle_call(bot, store: Store, path: Path) -> None:
                            f"{info}\n전사문은 로컬에만 저장했습니다: `{out}`")
 
 
+def handle_call(bot, store: Store, path: Path, notify: bool = True) -> dict | None:
+    """통화 녹음 1건을 처리한다. 실패하면 실패 항목을 남기고 돌려준다(성공하면 None).
+
+    어디서 실패하든 조용히 사라지지 않게 DB에 남기고, notify면 슬랙으로도 알린다.
+    """
+    with _call_lock:
+        try:
+            _process_call(bot, store, path)
+        except pipeline.ProcessError as e:  # 전사와 원문 저장은 끝났고 정리만 실패
+            store.resolve_failures(stage="call", target=str(path))
+            failure = e.failure
+        except Exception as e:
+            log.exception("통화 녹음 처리 실패: %s", path)
+            failure = store.record_failure("call", str(path), str(e) or type(e).__name__)
+        else:
+            store.resolve_failures(stage="call", target=str(path))
+            return None
+    if notify:
+        try:
+            bot.post_failure(failure)
+        except Exception:
+            log.exception("실패 알림 전송 실패(조치 목록에는 남아 있습니다)")
+    return failure
+
+
+def digest_tick(bot, store: Store, now: datetime) -> None:
+    """마감 정리를 평일 하루 한 번 보낸다. 보낸 날짜를 DB에 남겨 재시작해도 다시 보내지 않는다.
+
+    전송에 실패하면 DIGEST_RETRY_MIN분 뒤 다시 시도하고, DIGEST_RETRIES번 실패하면 실패 항목으로 남긴다.
+    앱을 늦게 켠 날에도 한 번은 보낸다.
+    """
+    today = now.date().isoformat()
+    if (now.weekday() >= 5 or now.strftime("%H:%M") < cfg.digest_time
+            or store.get_state("digest_sent_on") == today):
+        return
+    tries = json.loads(store.get_state("digest_try") or "{}")
+    n = tries.get("n", 0) if tries.get("day") == today else 0
+    if n >= DIGEST_RETRIES:
+        return
+    if n and now < datetime.fromisoformat(tries["at"]) + timedelta(minutes=DIGEST_RETRY_MIN):
+        return
+    try:
+        bot.send_digest(now.date())
+    except Exception as e:
+        log.exception("다이제스트 전송 실패 (%d/%d)", n + 1, DIGEST_RETRIES)
+        store.set_state("digest_try", json.dumps({"day": today, "n": n + 1, "at": now.isoformat()}))
+        if n + 1 >= DIGEST_RETRIES:
+            store.record_failure("digest", today, str(e) or type(e).__name__)
+        return
+    store.set_state("digest_sent_on", today)
+    store.resolve_failures(stage="digest", target=today)
+
+
 def digest_loop(bot, store: Store) -> None:
-    sent_on = None
     while True:
-        now = datetime.now()
-        if now.strftime("%H:%M") >= cfg.digest_time and sent_on != now.date() and now.weekday() < 5:
-            # 앱을 늦게 켠 날에도 한 번은 보낸다
-            try:
-                bot.post_dm(digest.build(store))
-            except Exception:
-                log.exception("다이제스트 전송 실패")
-            sent_on = now.date()
+        try:
+            digest_tick(bot, store, datetime.now())
+        except Exception:
+            log.exception("다이제스트 점검 실패")
         time.sleep(30)
 
 
@@ -70,7 +132,15 @@ def main() -> None:
     bot = Bot(store)
 
     if cfg.call_dir:
-        watcher = CallWatcher(cfg.call_dir, store, lambda p: handle_call(bot, store, p))
+        # 처음 켠 시점을 기억해 두고, 그 뒤에 생겼는데 놓친 녹음은 켤 때마다 처리할지 묻는다
+        baseline = store.get_state("calls_baseline")
+        if baseline is None:
+            baseline = str(time.time())
+            store.set_state("calls_baseline", baseline)
+        watcher = CallWatcher(cfg.call_dir, store, lambda p: handle_call(bot, store, p),
+                              baseline=float(baseline), on_missed=bot.post_missed)
+        bot.watcher = watcher
+        bot.process_call = lambda p, notify=True: handle_call(bot, store, p, notify)
         threading.Thread(target=watcher.run_forever, daemon=True, name="calls").start()
     else:
         log.info("CALL_DIR 미설정: 통화 녹음 감시를 끕니다")

@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 import pytest
 
-from dugwali import digest, pipeline
+from dugwali import app, digest, pipeline
 from dugwali.agent import extract, llm, render
 from dugwali.config import cfg
 from dugwali.ingest.watcher import CallWatcher
@@ -272,3 +272,294 @@ def test_slack_blocks_offer_merge_and_delete(store, monkeypatch):
     assert listed == ["case_view", "case_close", "case_delete"] * 2
     view = slack_ui.case_view_blocks(store, a["case_id"], a["data"])
     assert view[-1]["elements"][0]["value"] == f"c{a['case_id']}"
+
+
+# ---------- 조용히 사라지는 건 없애기 ----------
+
+class FakeBot:
+    """슬랙 없이 봇이 올린 것을 기록한다."""
+
+    def __init__(self, store, fail=0):
+        self.store, self.fail, self.sent = store, fail, []
+
+    def _post(self, kind, payload):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("slack down")
+        self.sent.append((kind, payload))
+
+    def post_dm(self, text, blocks=None):
+        self._post("dm", text)
+
+    def post_record(self, rec, prefix=""):
+        self._post("record", rec["id"])
+
+    def post_held_call(self, rec, info):
+        self._post("held", rec["id"])
+
+    def post_failure(self, f):
+        self._post("failure", f["id"])
+
+    def send_digest(self, day=None):
+        self._post("digest", day)
+
+
+@pytest.fixture
+def broken_llm(monkeypatch):
+    state = {"broken": True}
+
+    def fake(prompt):
+        if state["broken"]:
+            raise llm.LLMError("한도 초과")
+        return dict(SAMPLE)
+
+    monkeypatch.setattr(llm, "call_json", fake)
+    return state
+
+
+def test_raw_text_is_kept_when_llm_fails_and_retry_fills_it(store, broken_llm):
+    with pytest.raises(pipeline.ProcessError) as e:
+        pipeline.process(store, "중요한 메모", "cli")
+    rec = e.value.record
+    assert store.get_record(rec["id"])["raw_text"] == "중요한 메모" and store.get_record(rec["id"])["data"] is None
+    with pytest.raises(pipeline.ProcessError):
+        pipeline.summarize(store, rec["id"])
+    (f,) = store.open_failures()                       # 같은 기록의 실패는 한 건으로 쌓인다
+    assert f["stage"] == "extract" and f["record_id"] == rec["id"] and f["attempts"] == 2
+    assert "처리 실패 1건" in digest.build(store) and "정리 안 된 기록" not in digest.build(store)
+
+    broken_llm["broken"] = False
+    assert pipeline.summarize(store, rec["id"])["data"]["title"] == "견적서 재요청"
+    assert store.open_failures() == [] and len(store.open_todos()) == 2
+    assert "조치 필요" not in digest.build(store)
+
+
+def test_deleting_record_closes_its_failure(store, broken_llm):
+    with pytest.raises(pipeline.ProcessError) as e:
+        pipeline.process(store, "메모")
+    pipeline.delete(store, e.value.record["id"])
+    assert store.open_failures() == [] and digest.attention(store) == ([], [])
+
+
+def test_held_call_shows_up_as_attention_in_digest(store, fake_llm):
+    pipeline.hold(store, "화자1: 안녕하세요", "call")
+    failures, pending = digest.attention(store)
+    assert failures == [] and len(pending) == 1
+    assert "정리 안 된 기록 1건" in digest.build(store)
+
+
+def test_digest_puts_overdue_and_imminent_own_todos_first(store, monkeypatch):
+    today = date(2026, 11, 17)
+    monkeypatch.setattr(llm, "call_json", lambda p: {**SAMPLE, "todos": [
+        {"task": "먼 일", "owner": "나", "due": "2026-11-30"},
+        {"task": "내일 일", "owner": "나", "due": "2026-11-18"},
+        {"task": "지난 일", "owner": None, "due": "2026-11-14"},
+        {"task": "남의 지난 일", "owner": "김과장", "due": "2026-11-10"},
+    ]})
+    pipeline.process(store, "메모")
+    lines = digest.build(store, today).splitlines()
+    assert lines[1] == "*먼저 할 일 2건*"
+    assert "3일 지남" in lines[2] and "지난 일 — #1 견적서 재요청" in lines[2]
+    assert lines[3].startswith("• 내일까지 · 내일 일")
+    rest = "\n".join(lines[4:])
+    assert "지난 일 —" not in rest                       # 위에 올린 것은 아래에서 되풀이하지 않는다
+    assert rest.index("◦ 먼 일") < rest.index("◦ 김과장: 남의 지난 일")   # 건 안에서는 내 할 일 먼저
+
+
+def test_call_failure_is_recorded_notified_and_retryable(store, fake_llm, tmp_path, monkeypatch):
+    import dugwali.stt.transcribe as stt
+
+    state = {"broken": True}
+
+    def fake_transcribe(path, speakers=2, diarize=None):
+        if state["broken"]:
+            raise RuntimeError("모델 로드 실패")
+        return {"text": "화자1: 견적 건입니다", "duration": 60.0, "elapsed": 5.0, "diarized": False}
+
+    monkeypatch.setattr(stt, "transcribe", fake_transcribe)
+    cfg.ensure_dirs()
+    bot, path = FakeBot(store), tmp_path / "call.m4a"
+    f = app.handle_call(bot, store, path)
+    assert f["stage"] == "call" and bot.sent == [("failure", f["id"])]
+    assert app.handle_call(bot, store, path, notify=False)["attempts"] == 2 and len(bot.sent) == 1
+
+    state["broken"] = False
+    assert app.handle_call(bot, store, path) is None and store.open_failures() == []
+    assert bot.sent[-1][0] == "held"                    # 기본 설정: 전사문은 보관만 하고 버튼을 낸다
+    assert app.handle_call(bot, store, path) is None    # 이미 기록이 있으면 다시 전사하지 않는다
+    assert len(store.unprocessed_records()) == 1
+
+
+def test_call_is_not_lost_when_slack_post_fails(store, fake_llm, tmp_path, monkeypatch):
+    import dugwali.stt.transcribe as stt
+
+    calls = []
+    monkeypatch.setattr(stt, "transcribe", lambda path, speakers=2, diarize=None: calls.append(path) or {
+        "text": "화자1: 견적 건입니다", "duration": 60.0, "elapsed": 5.0, "diarized": False})
+    monkeypatch.setattr(cfg, "send_calls_to_llm", True)
+    cfg.ensure_dirs()
+    bot, path = FakeBot(store, fail=2), tmp_path / "call.m4a"   # 초안 올리기도, 실패 알림도 실패
+    f = app.handle_call(bot, store, path)
+    assert f["stage"] == "call" and bot.sent == [] and len(store.open_failures()) == 1
+    assert app.handle_call(bot, store, path, notify=False) is None
+    assert bot.sent == [("record", 1)] and len(calls) == 1      # 다시 전사하지 않고 올리기만 한다
+
+
+def test_digest_is_sent_once_per_day_and_retried_with_backoff(store, fake_llm):
+    t = datetime(2026, 11, 17, 17, 30)                          # 화요일
+    bot = FakeBot(store)
+    app.digest_tick(bot, store, datetime(2026, 11, 17, 17, 29))
+    app.digest_tick(bot, store, datetime(2026, 11, 14, 18, 0))  # 토요일
+    assert bot.sent == []
+    app.digest_tick(bot, store, t)
+    app.digest_tick(bot, store, t.replace(hour=18))
+    app.digest_tick(FakeBot(store), store, t.replace(hour=19))  # 재시작해도 다시 보내지 않는다
+    assert [k for k, _ in bot.sent] == ["digest"]
+
+    day2 = datetime(2026, 11, 18, 17, 30)
+    down = FakeBot(store, fail=99)
+    app.digest_tick(down, store, day2)
+    app.digest_tick(down, store, day2.replace(minute=35))       # 10분이 안 지나면 다시 시도하지 않는다
+    assert down.fail == 98
+    app.digest_tick(down, store, day2.replace(minute=41))
+    assert store.open_failures() == []
+    app.digest_tick(down, store, day2.replace(minute=52))       # 세 번째 실패: 실패 항목으로 남긴다
+    app.digest_tick(down, store, day2.replace(hour=19))         # 그 뒤로는 더 시도하지 않는다
+    assert down.fail == 96
+    (f,) = store.open_failures()
+    assert f["stage"] == "digest" and f["target"] == "2026-11-18"
+
+    app.digest_tick(bot, store, datetime(2026, 11, 19, 17, 30)) # 다음 날은 정상
+    assert [k for k, _ in bot.sent] == ["digest", "digest"]
+
+
+def test_watcher_reports_missed_recordings_instead_of_dropping(store, tmp_path):
+    folder = tmp_path / "calls"
+    folder.mkdir()
+    now = time.time()
+
+    def make(name, age):
+        p = folder / name
+        p.write_bytes(b"abc")
+        os.utime(p, (now - age, now - age))
+        return p
+
+    make("before-install.m4a", 7200)
+    missed = make("while-off.m4a", 1800)
+    asked, seen = [], []
+    w = CallWatcher(folder, store, seen.append, since=now - 60, baseline=now - 3600, on_missed=asked.append)
+    w.scan_once()
+    w.scan_once()
+    w.scan_once()
+    assert asked == [[missed]] and seen == []           # 한 번만 묻고, 자동으로 처리하지 않는다
+    assert w.missed() == [missed]
+    again = CallWatcher(folder, store, seen.append, since=now, baseline=now - 3600)
+    assert again.missed() == [missed]                   # 답하지 않으면 다음에 켤 때 다시 나온다
+    assert again.skip_missed() == 1 and again.missed() == [] and w.missed() == []
+
+
+def test_slack_attention_blocks_list_failures_pending_and_missed(store, broken_llm, tmp_path):
+    with pytest.raises(pipeline.ProcessError):
+        pipeline.process(store, "메모")
+    pipeline.hold(store, "전사문 내용", "call", str(tmp_path / "call.m4a"))
+    blocks = slack_ui.attention_blocks(store, [tmp_path / "old.m4a"])
+    ids = [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+    assert ids == ["retry_failure", "dismiss_failure", "pending_summarize", "pending_delete",
+                   "missed_process", "missed_skip"]
+    text = " ".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    assert "한도 초과" in text and "call.m4a" in text and "old.m4a" in text
+    assert "전사문 내용" not in text                     # 승인 전 전사문은 슬랙에도 싣지 않는다
+    store.resolve_failures(fid=store.open_failures()[0]["id"])
+    pipeline.delete(store, 1)
+    pipeline.delete(store, 2)
+    assert slack_ui.attention_blocks(store)[0]["text"]["text"] == "조치할 것이 없습니다."
+
+
+class FakeClient:
+    def __init__(self):
+        self.n, self.messages = 0, {}   # ts → {"text", "blocks"}
+
+    def chat_postMessage(self, channel, text=None, blocks=None, thread_ts=None):
+        self.n += 1
+        ts = f"{self.n}.0"
+        self.messages[ts] = {"text": text, "blocks": blocks or []}
+        return {"ts": ts, "channel": channel}
+
+    def chat_update(self, channel, ts, text=None, blocks=None):
+        self.messages[ts] = {"text": text, "blocks": blocks or []}
+
+    def reactions_add(self, **kw):
+        pass
+
+    def conversations_open(self, users):
+        return {"channel": {"id": "D1"}}
+
+    def actions(self, ts):
+        return {e["action_id"]: e["value"] for b in self.messages[ts]["blocks"] if b["type"] == "actions"
+                for e in b["elements"] if "value" in e}
+
+
+class FakeApp:
+    def __init__(self, token=None):
+        self.client, self.handlers = FakeClient(), {}
+
+    def event(self, name):
+        return lambda fn: self.handlers.setdefault(name, fn)
+
+    action = event
+
+
+@pytest.fixture
+def bot(store, monkeypatch):
+    monkeypatch.setattr(slack_ui, "App", FakeApp)
+    monkeypatch.setattr(cfg, "owner_user_id", "U1")
+    b = slack_ui.Bot(store)
+
+    def say(text, ts="100.0"):
+        b.app.handlers["message"]({"channel_type": "im", "user": "U1", "channel": "D1", "ts": ts, "text": text},
+                                  b.app.client)
+
+    def click(action_id, ts):
+        client = b.app.client
+        body = {"actions": [{"value": client.actions(ts)[action_id]}], "channel": {"id": "D1"},
+                "message": {"ts": ts}}
+        b.app.handlers[action_id](lambda: None, body, client)
+
+    b.say, b.click = say, click
+    return b
+
+
+def test_slack_memo_failure_can_be_retried_in_place(bot, store, broken_llm):
+    client = bot.app.client
+    bot.say("급한 메모")
+    assert set(client.actions("1.0")) == {"retry_failure", "dismiss_failure"}
+    assert store.get_record(1)["raw_text"] == "급한 메모"
+    bot.click("retry_failure", "1.0")                   # 아직 고장: 같은 자리에 실패가 다시 뜬다
+    assert "retry_failure" in client.actions("1.0") and store.open_failures()[0]["attempts"] == 2
+    broken_llm["broken"] = False
+    bot.click("retry_failure", "1.0")
+    assert "fmt_slack" in client.actions("1.0") and store.open_failures() == []   # 그 자리가 초안이 된다
+    assert len(client.messages) == 1
+
+
+def test_slack_attention_list_retries_and_refreshes(bot, store, broken_llm):
+    client = bot.app.client
+    bot.say("메모 하나")
+    held = pipeline.hold(store, "전사문", "call")
+    bot.post_held_call(held, "통화 전사 완료")           # 2.0
+    bot.say("조치", ts="101.0")                          # 3.0
+    assert "처리 실패 1건 · 정리 안 된 기록 1건" in client.messages["3.0"]["blocks"][0]["text"]["text"]
+    broken_llm["broken"] = False
+    bot.click("retry_failure", "3.0")
+    assert "fmt_slack" in client.actions("1.0")         # 원래 자리에 초안이 그려지고
+    assert set(client.actions("3.0")) == {"pending_summarize", "pending_delete"}   # 목록은 줄어든다
+    bot.click("pending_summarize", "3.0")
+    assert "fmt_slack" in client.actions("2.0")
+    assert client.messages["3.0"]["blocks"][0]["text"]["text"] == "조치할 것이 없습니다."
+
+
+def test_slack_dismiss_keeps_raw_record_listed(bot, store, broken_llm):
+    bot.say("메모")
+    bot.click("dismiss_failure", "1.0")
+    assert store.open_failures() == [] and "정리 안 된 기록" in bot.app.client.messages["1.0"]["text"]
+    assert len(digest.attention(store)[1]) == 1

@@ -3,7 +3,8 @@
 - DM에 메모(또는 음성 파일)를 던지면 → 스레드에 두괄식 초안 + 양식 버튼
 - 그 스레드에 답글을 달면 → 보충 정보로 합쳐 초안 갱신
 - 초안의 버튼으로 다른 건에 합치기 / 삭제
-- "건" / "할일" / "오늘" / "도움말" 명령
+- "건" / "할일" / "오늘" / "조치" / "도움말" 명령
+- 처리에 실패한 건은 다시 시도 버튼과 함께 알리고, "조치" 목록에 남긴다
 """
 import logging
 import urllib.request
@@ -15,6 +16,7 @@ from slack_bolt import App
 from .. import digest, pipeline
 from ..agent import render
 from ..config import cfg
+from ..labels import SOURCE_LABEL
 from ..store import Store
 from .watcher import AUDIO_EXT
 
@@ -26,9 +28,12 @@ HELP = (
     "• 정리된 스레드에 답글을 달면 그 내용을 반영해 다시 정리합니다.\n"
     "• 같은 일에 대한 기록은 초안의 *합치기* 버튼으로 한 건으로 묶습니다. 일이 끝난 뒤의 후속 메모도 같은 방법으로 붙입니다.\n"
     "• 음성 메모 파일을 올리면 받아써서 정리합니다.\n"
-    "• `건` 진행 중인 건 목록(통합 정리·종결·삭제) · `할일` 미완료 목록 · `오늘` 오늘 정리 · `도움말`"
+    "• `건` 진행 중인 건 목록(통합 정리·종결·삭제) · `할일` 미완료 목록 · `오늘` 오늘 정리\n"
+    "• `조치` 처리에 실패했거나 아직 정리 안 된 기록, 놓친 통화 녹음 · `도움말`"
 )
 MAX_CASES_LISTED = 15
+MAX_ATTENTION_LISTED = 10
+STAGE_LABEL = {"extract": "정리", "call": "통화 녹음 처리", "digest": "마감 정리 전송"}
 
 
 def _plain(text: str, limit: int = 75) -> dict:
@@ -151,9 +156,73 @@ def held_call_blocks(rec: dict, info: str) -> list[dict]:
     ]
 
 
+def _failure_name(f: dict) -> str:
+    if f["stage"] == "call":
+        return f"`{Path(f['target']).name}`"
+    if f["stage"] == "extract":
+        return f"기록 {f['record_id']}"
+    return f["target"]
+
+
+def failure_blocks(f: dict, in_list: bool = False) -> list[dict]:
+    """실패 한 건: 무엇이 왜 실패했는지와 다시 시도·넘기기 버튼."""
+    kept = "\n원문은 저장돼 있습니다." if f["stage"] == "extract" else ""
+    value = f"{'L' if in_list else 'S'}:{f['id']}"
+    return [
+        _section(f"⚠️ *{STAGE_LABEL.get(f['stage'], f['stage'])} 실패* · {_failure_name(f)} · "
+                 f"시도 {f['attempts']}회{kept}\n```{f['error'][:300]}```"),
+        {"type": "actions", "elements": [
+            _button("다시 시도", "retry_failure", value, "primary"),
+            _button("넘기기", "dismiss_failure", value),
+        ]},
+    ]
+
+
+def missed_blocks(paths: list[Path], in_list: bool = False) -> list[dict]:
+    names = "\n".join(f"• `{p.name}`" for p in paths[:MAX_ATTENTION_LISTED])
+    more = f"\n… 외 {len(paths) - MAX_ATTENTION_LISTED}개" if len(paths) > MAX_ATTENTION_LISTED else ""
+    value = "L" if in_list else "S"
+    return [
+        _section(f"📼 *놓친 통화 녹음 {len(paths)}개* (꺼져 있던 동안 생겼거나 늦게 동기화됨)\n{names}{more}"),
+        {"type": "actions", "elements": [
+            _button("모두 처리", "missed_process", value, "primary"),
+            _button("건너뛰기", "missed_skip", value),
+        ]},
+    ]
+
+
+def attention_blocks(store: Store, missed: list[Path] = ()) -> list[dict]:
+    """사람이 조치해야 하는 것 전부: 처리 실패, 아직 정리 안 된 기록, 놓친 통화 녹음."""
+    failures, pending = digest.attention(store)
+    if not failures and not pending and not missed:
+        return [_section("조치할 것이 없습니다.")]
+    blocks = [_section(f"*조치 필요* · 처리 실패 {len(failures)}건 · 정리 안 된 기록 {len(pending)}건"
+                       f" · 놓친 통화 녹음 {len(missed)}개")]
+    for f in failures[:MAX_ATTENTION_LISTED]:
+        blocks += failure_blocks(f, in_list=True)
+    for r in pending[:MAX_ATTENTION_LISTED]:
+        rid = str(r["id"])
+        name = f" · `{Path(r['audio_path']).name}`" if r.get("audio_path") else ""
+        blocks.append(_section(f"📄 *기록 {rid}* · {r['created_at'][:16].replace('T', ' ')} · "
+                               f"{SOURCE_LABEL.get(r['source'], r['source'])}{name} · 아직 정리 안 됨"))
+        blocks.append({"type": "actions", "elements": [
+            _button("정리하기 (LLM으로 전송)", "pending_summarize", rid, "primary"),
+            _button("삭제", "pending_delete", rid, "danger", "이 기록을 지웁니다. 전사문 파일은 남습니다."),
+        ]})
+    hidden = max(len(failures) - MAX_ATTENTION_LISTED, 0) + max(len(pending) - MAX_ATTENTION_LISTED, 0)
+    if hidden:
+        blocks.append(_context(f"{hidden}건은 목록에 다 싣지 못했습니다. 위 항목을 처리한 뒤 `조치`를 다시 보내세요."))
+    if missed:
+        blocks += missed_blocks(list(missed), in_list=True)
+    return blocks
+
+
 class Bot:
     def __init__(self, store: Store) -> None:
         self.store = store
+        # 통화 녹음 감시를 켰을 때 app.py가 채운다
+        self.watcher = None        # CallWatcher
+        self.process_call = None   # (Path, notify: bool) -> 남은 실패 항목 또는 None
         self.app = App(token=cfg.slack_bot_token)
         self._dm_channel: str | None = None
         self._register()
@@ -179,7 +248,58 @@ class Bot:
         res = self.post_dm(info, held_call_blocks(rec, info))
         self.store.set_slack_ref(rec["id"], res["channel"], res["ts"], res["ts"])
 
+    def post_failure(self, f: dict) -> None:
+        """실패를 DM으로 알린다. 원문이 저장된 기록이면 이 메시지를 그 기록의 자리로 삼는다."""
+        res = self.post_dm(f"{STAGE_LABEL.get(f['stage'], f['stage'])} 실패", failure_blocks(f))
+        self._link(f, res["channel"], res["ts"])
+
+    def post_missed(self, paths: list[Path]) -> None:
+        self.post_dm(f"놓친 통화 녹음 {len(paths)}개", missed_blocks(paths))
+
+    def send_digest(self, day: date | None = None) -> None:
+        self.post_dm(digest.build(self.store, day))
+
     # --- 내부 ---
+    def _link(self, f: dict, channel: str, ts: str) -> None:
+        rec = self.store.get_record(f["record_id"]) if f.get("record_id") else None
+        if rec and not rec.get("msg_ts"):
+            self.store.set_slack_ref(rec["id"], channel, ts, ts)
+
+    def _missed(self) -> list[Path]:
+        return self.watcher.missed() if self.watcher else []
+
+    def _show(self, client, rec: dict) -> None:
+        """정리된 기록을 제자리에 그린다. 자리가 없으면 DM에 새로 올린다."""
+        if rec.get("channel") and rec.get("msg_ts"):
+            self._redraw(client, rec)
+        else:
+            self.post_record(rec)
+
+    def _retry(self, client, f: dict) -> dict | None:
+        """실패한 작업을 다시 한다. 또 실패하면 그 실패 항목을, 성공하면 None을 돌려준다."""
+        store = self.store
+        if f["stage"] == "extract":
+            if not store.get_record(f["record_id"]):
+                store.resolve_failures(fid=f["id"])
+                return None
+            try:
+                self._show(client, pipeline.summarize(store, f["record_id"]))
+            except pipeline.ProcessError as e:
+                return e.failure
+            return None
+        if f["stage"] == "call":
+            if not self.process_call:
+                return store.record_failure("call", f["target"], "통화 녹음 감시가 꺼져 있습니다(CALL_DIR).")
+            return self.process_call(Path(f["target"]), False)
+        if f["stage"] == "digest":
+            try:
+                self.send_digest(date.fromisoformat(f["target"]))
+            except Exception as e:
+                return store.record_failure("digest", f["target"], str(e) or type(e).__name__)
+            store.set_state("digest_sent_on", f["target"])
+        store.resolve_failures(fid=f["id"])
+        return None
+
     def _download(self, f: dict) -> Path:
         cfg.ensure_dirs()
         dest = cfg.transcript_dir / f"slack_{f['id']}_{Path(f.get('name') or 'audio').name}"
@@ -234,6 +354,10 @@ class Bot:
             if text in ("오늘", "정리", "digest"):
                 client.chat_postMessage(channel=channel, text=digest.build(store))
                 return
+            if text in ("조치", "조치 필요", "실패"):
+                client.chat_postMessage(channel=channel, text="조치 필요",
+                                        blocks=attention_blocks(store, self._missed()))
+                return
             if text in ("도움말", "help", "?"):
                 client.chat_postMessage(channel=channel, text=HELP)
                 return
@@ -260,6 +384,10 @@ class Bot:
                 rec = pipeline.process(store, text, source, audio_path)
                 store.set_slack_ref(rec["id"], channel, ts, holder["ts"])
                 self._redraw(client, store.get_record(rec["id"]))
+            except pipeline.ProcessError as e:  # 원문은 저장됨: 이 자리에서 다시 시도할 수 있게 한다
+                store.set_slack_ref(e.record["id"], channel, ts, holder["ts"])
+                client.chat_update(channel=channel, ts=holder["ts"], text="정리 실패",
+                                   blocks=failure_blocks(e.failure))
             except Exception as e:
                 log.exception("메모 처리 실패")
                 client.chat_update(channel=channel, ts=holder["ts"],
@@ -302,6 +430,8 @@ class Bot:
             client.chat_update(channel=channel, ts=ts, text="정리 중…", blocks=[])
             try:
                 self._redraw(client, pipeline.summarize(store, rid))
+            except pipeline.ProcessError as e:
+                client.chat_update(channel=channel, ts=ts, text="요약 실패", blocks=failure_blocks(e.failure))
             except Exception as e:
                 log.exception("통화 요약 실패")
                 client.chat_update(channel=channel, ts=ts, text=f"요약 실패: {e}")
@@ -361,6 +491,92 @@ class Bot:
                 fn(store, int(body["actions"][0]["value"]))
                 client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"],
                                    text="진행 중인 건", blocks=case_list_blocks(store))
+
+        # --- 조치 필요: 실패 다시 시도, 정리 안 된 기록, 놓친 통화 녹음 ---
+        def _relist(client, body) -> None:
+            client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text="조치 필요",
+                               blocks=attention_blocks(store, self._missed()))
+
+        def _failure_action(body):
+            where, _, fid = body["actions"][0]["value"].partition(":")
+            return where == "L", store.get_failure(int(fid))
+
+        @app.action("retry_failure")
+        def on_retry_failure(ack, body, client):
+            ack()
+            channel, ts = body["channel"]["id"], body["message"]["ts"]
+            in_list, f = _failure_action(body)
+            left = None
+            if f and not f["resolved_at"]:
+                if not in_list:
+                    client.chat_update(channel=channel, ts=ts, text="다시 시도 중…", blocks=[])
+                try:
+                    left = self._retry(client, f)
+                except Exception as e:
+                    log.exception("다시 시도 실패")
+                    left = store.record_failure(f["stage"], f["target"], str(e) or type(e).__name__,
+                                                f["record_id"])
+            if in_list:
+                _relist(client, body)
+            elif left:
+                self._link(left, channel, ts)
+                client.chat_update(channel=channel, ts=ts, text="다시 실패", blocks=failure_blocks(left))
+            else:
+                rec = store.get_record(f["record_id"]) if f and f.get("record_id") else None
+                if not (rec and rec.get("msg_ts") == ts and rec["data"]):  # 초안으로 바뀐 자리는 그대로 둔다
+                    client.chat_update(channel=channel, ts=ts, text="✅ 다시 처리했습니다.", blocks=[])
+
+        @app.action("dismiss_failure")
+        def on_dismiss_failure(ack, body, client):
+            ack()
+            in_list, f = _failure_action(body)
+            if f:
+                store.resolve_failures(fid=f["id"])
+            if in_list:
+                _relist(client, body)
+            else:
+                note = " 원문은 `조치` 목록의 정리 안 된 기록에 남아 있습니다." if f and f["stage"] == "extract" else ""
+                client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"],
+                                   text=f"넘겼습니다.{note}", blocks=[])
+
+        @app.action("pending_summarize")
+        def on_pending_summarize(ack, body, client):
+            ack()
+            try:
+                self._show(client, pipeline.summarize(store, int(body["actions"][0]["value"])))
+            except Exception:
+                log.exception("정리 실패")  # 실패 항목으로 목록에 다시 나온다
+            _relist(client, body)
+
+        @app.action("pending_delete")
+        def on_pending_delete(ack, body, client):
+            ack()
+            pipeline.delete(store, int(body["actions"][0]["value"]))
+            _relist(client, body)
+
+        @app.action("missed_process")
+        def on_missed_process(ack, body, client):
+            ack()
+            paths = self._missed()
+            if body["actions"][0]["value"] != "L":
+                client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], blocks=[],
+                                   text=f"놓친 통화 녹음 {len(paths)}개를 처리합니다. 끝나는 대로 하나씩 올라옵니다.")
+            for p in paths:
+                store.mark_seen(str(p))
+                if self.process_call:
+                    self.process_call(p, True)
+            if body["actions"][0]["value"] == "L":
+                _relist(client, body)
+
+        @app.action("missed_skip")
+        def on_missed_skip(ack, body, client):
+            ack()
+            n = self.watcher.skip_missed() if self.watcher else 0
+            if body["actions"][0]["value"] == "L":
+                _relist(client, body)
+            else:
+                client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], blocks=[],
+                                   text=f"놓친 통화 녹음 {n}개를 건너뛰었습니다. 파일은 그대로 있습니다.")
 
         _case_list_action("case_close", pipeline.close)
         _case_list_action("case_delete", pipeline.delete_case)

@@ -1,4 +1,5 @@
-"""SQLite 저장소: 건(cases), 기록(records), 할 일(todos), 처리한 녹음 파일(seen_files).
+"""SQLite 저장소: 건(cases), 기록(records), 할 일(todos), 처리한 녹음 파일(seen_files),
+처리 실패(failures), 앱 상태(app_state).
 
 기록은 메모·통화 1개이고, 건은 같은 일에 속한 기록들의 묶음이다. 모든 기록은 건 하나에 속한다.
 """
@@ -39,6 +40,17 @@ CREATE TABLE IF NOT EXISTS todos (
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS seen_files (path TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    target TEXT NOT NULL,
+    record_id INTEGER,
+    error TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 UNTITLED = "미정리 기록"
 
@@ -140,6 +152,9 @@ class Store:
         with self._lock, self._db:
             self._db.execute(
                 "DELETE FROM todos WHERE record_id IN (SELECT id FROM records WHERE case_id=?)", (cid,))
+            self._db.execute(
+                "UPDATE failures SET resolved_at=? WHERE resolved_at IS NULL"
+                " AND record_id IN (SELECT id FROM records WHERE case_id=?)", (_now(), cid))
             self._db.execute("DELETE FROM records WHERE case_id=?", (cid,))
             self._db.execute("DELETE FROM cases WHERE id=?", (cid,))
         return recs
@@ -203,6 +218,8 @@ class Store:
             return None
         with self._lock, self._db:
             self._db.execute("DELETE FROM todos WHERE record_id=?", (rid,))
+            self._db.execute(
+                "UPDATE failures SET resolved_at=? WHERE resolved_at IS NULL AND record_id=?", (_now(), rid))
             self._db.execute("DELETE FROM records WHERE id=?", (rid,))
             if not self._drop_if_empty(rec["case_id"]):
                 self._touch(rec["case_id"])
@@ -225,6 +242,17 @@ class Store:
                 "SELECT * FROM records WHERE channel=? AND thread_ts=? ORDER BY id DESC LIMIT 1",
                 (channel, thread_ts),
             ).fetchone())
+
+    def find_by_audio(self, audio_path: str) -> dict | None:
+        with self._lock:
+            return _row(self._db.execute(
+                "SELECT * FROM records WHERE audio_path=? ORDER BY id DESC LIMIT 1", (audio_path,)).fetchone())
+
+    def unprocessed_records(self) -> list[dict]:
+        """아직 정리(구조화)하지 않은 기록: 요약 승인 전 통화, 정리에 실패한 메모."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM records WHERE data IS NULL ORDER BY created_at, id").fetchall()
+        return [_row(r) for r in rows]
 
     def records_on(self, day: str) -> list[dict]:
         """day: YYYY-MM-DD"""
@@ -299,3 +327,58 @@ class Store:
     def mark_seen(self, path: str) -> None:
         with self._lock, self._db:
             self._db.execute("INSERT OR IGNORE INTO seen_files (path, seen_at) VALUES (?,?)", (path, _now()))
+
+    # --- failures ---
+    def record_failure(self, stage: str, target: str, error: str, record_id: int | None = None) -> dict:
+        """실패를 남긴다. 같은 대상의 열린 실패가 있으면 새로 만들지 않고 시도 횟수만 올린다."""
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT id FROM failures WHERE stage=? AND target=? AND resolved_at IS NULL", (stage, target)
+            ).fetchone()
+            if row:
+                fid = row["id"]
+                self._db.execute("UPDATE failures SET attempts=attempts+1, error=? WHERE id=?", (error[:500], fid))
+            else:
+                fid = self._db.execute(
+                    "INSERT INTO failures (created_at, stage, target, record_id, error) VALUES (?,?,?,?,?)",
+                    (_now(), stage, target, record_id, error[:500])).lastrowid
+        return self.get_failure(fid)
+
+    def record_has_failure(self, rid: int) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM failures WHERE record_id=? AND resolved_at IS NULL", (rid,)).fetchone() is not None
+
+    def get_failure(self, fid: int) -> dict | None:
+        with self._lock:
+            r = self._db.execute("SELECT * FROM failures WHERE id=?", (fid,)).fetchone()
+        return dict(r) if r else None
+
+    def open_failures(self) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._db.execute(
+                "SELECT * FROM failures WHERE resolved_at IS NULL ORDER BY id")]
+
+    def resolve_failures(self, *, fid: int | None = None, stage: str | None = None,
+                         target: str | None = None) -> None:
+        """실패 항목을 닫는다. 번호로, 또는 단계+대상으로 지정한다."""
+        with self._lock, self._db:
+            if fid is not None:
+                self._db.execute("UPDATE failures SET resolved_at=? WHERE id=? AND resolved_at IS NULL",
+                                 (_now(), fid))
+            else:
+                self._db.execute(
+                    "UPDATE failures SET resolved_at=? WHERE stage=? AND target=? AND resolved_at IS NULL",
+                    (_now(), stage, target))
+
+    # --- app state ---
+    def get_state(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            r = self._db.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO app_state (key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))

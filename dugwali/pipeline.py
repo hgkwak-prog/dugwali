@@ -1,4 +1,7 @@
-"""입구(슬랙·통화·CLI)와 무관한 핵심 흐름: 추출 → 저장 → 로그 갱신.
+"""입구(슬랙·통화·CLI)와 무관한 핵심 흐름: 원문 저장 → 추출 → 로그 갱신.
+
+원문을 먼저 저장하고 그다음에 구조화한다. 구조화(LLM)가 실패해도 원문은 남고,
+실패는 `failures`에 기록돼 나중에 다시 시도할 수 있다.
 
 기록(메모·통화 1개)은 건(같은 일의 묶음)에 속한다. 새 기록은 새 건으로 시작하고,
 관련 건은 제안만 한다(`data["related_case"]`). 합치는 것은 사용자가 정한다.
@@ -51,10 +54,35 @@ def _reconcile(store: Store, cid: int | None) -> None:
             log.exception("건 #%s 통합 정리 실패, 할 일은 기록별로 둡니다", cid)
 
 
+class ProcessError(LLMError):
+    """원문은 저장했지만 구조화에 실패했다. record: 저장된 기록, failure: 남긴 실패 항목."""
+
+    def __init__(self, record: dict, failure: dict, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.record, self.failure = record, failure
+
+
+def _target(rid: int) -> str:
+    return f"record:{rid}"
+
+
+def _structure(store: Store, rid: int) -> None:
+    """저장된 기록의 원문을 구조화해 채운다. 실패하면 실패 항목을 남기고 ProcessError를 던진다."""
+    rec = store.get_record(rid)
+    try:
+        data = ex.extract(rec["raw_text"], _label(rec["source"]), cases=_candidates(store, rec["case_id"]))
+    except LLMError as e:
+        log.warning("기록 %s 정리 실패: %s", rid, e)
+        raise ProcessError(rec, store.record_failure("extract", _target(rid), str(e), rid), e) from e
+    store.update_record(rid, data=data)
+    store.resolve_failures(stage="extract", target=_target(rid))
+
+
 def process(store: Store, raw_text: str, source: str = "slack", audio_path: str | None = None) -> dict:
     """새 기록을 만들고 구조화한다. 새 건으로 시작한다."""
-    data = ex.extract(raw_text, _label(source), cases=_candidates(store))
-    rec = store.get_record(store.add_record(source, raw_text, data, audio_path))
+    rid = store.add_record(source, raw_text, None, audio_path)
+    _structure(store, rid)
+    rec = store.get_record(rid)
     _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
     return rec
 
@@ -65,10 +93,9 @@ def hold(store: Store, raw_text: str, source: str, audio_path: str | None = None
 
 
 def summarize(store: Store, rid: int) -> dict:
-    """보관만 해 둔 기록을 사용자가 승인했을 때 구조화한다."""
+    """원문만 있는 기록을 구조화한다(통화 요약 승인, 정리 실패 뒤 다시 시도)."""
     rec = store.get_record(rid)
-    data = ex.extract(rec["raw_text"], _label(rec["source"]), cases=_candidates(store, rec["case_id"]))
-    store.update_record(rid, data=data)
+    _structure(store, rid)
     _reconcile(store, rec["case_id"])
     _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
     return store.get_record(rid)
