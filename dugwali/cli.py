@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         for r in pending:
             print(f"정리 안 된 기록 {r['id']} · {r['created_at'][:16]} · {r['source']}")
         if not failures and not pending:
-            print("조치할 것이 없습니다.")
+            print("막힌 건이 없습니다. (처리 실패 0건 · 정리 안 된 기록 0건)")
     else:
         store = Store(cfg.db_path)
         try:

@@ -21,7 +21,7 @@ DIGEST_RETRY_MIN = 10    # 실패하면 이만큼 기다렸다가 다시 시도�
 _call_lock = threading.Lock()  # 전사는 무겁다: 감시·다시 시도·놓친 녹음 처리가 겹치지 않게 한다
 
 
-def _process_call(bot, store: Store, path: Path) -> None:
+def _process_call(bot, store: Store, path: Path, provider: str | None = None) -> None:
     """통화 녹음 1건: 전사 → 전사문 저장 → (설정에 따라) 요약 또는 보관 후 버튼 제시."""
     rec = store.find_by_audio(str(path))
     if rec:  # 기록까지는 만들어졌던 파일(슬랙 전송만 실패): 다시 전사하지 않고 올리기만 한다
@@ -33,12 +33,14 @@ def _process_call(bot, store: Store, path: Path) -> None:
 
     from .stt.transcribe import transcribe
 
-    result = transcribe(str(path), speakers=2)
+    result = transcribe(str(path), speakers=2, provider=provider)
     text = f"파일명: {path.name}\n{result['text']}"
     out = cfg.transcript_dir / f"{path.stem}.txt"
     out.write_text(text, encoding="utf-8")
-    info = (f"📞 통화 전사 완료: `{path.name}` · {result['duration'] / 60:.1f}분 "
-            f"(처리 {result['elapsed']:.0f}초{', 화자 구분' if result['diarized'] else ''})")
+    length = f" · {result['duration'] / 60:.1f}분" if result["duration"] else ""  # API는 길이를 안 줄 수 있다
+    how = "외부 API" if result.get("provider") == "api" else "로컬"
+    info = (f"📞 통화 전사 완료: `{path.name}`{length} "
+            f"({how}, 처리 {result['elapsed']:.0f}초{', 화자 구분' if result['diarized'] else ''})")
     if not result["text"].strip():
         bot.post_dm(f"{info}\n받아쓴 내용이 없습니다.")
     elif cfg.send_calls_to_llm:
@@ -48,14 +50,14 @@ def _process_call(bot, store: Store, path: Path) -> None:
                            f"{info}\n전사문은 로컬에만 저장했습니다: `{out}`")
 
 
-def handle_call(bot, store: Store, path: Path, notify: bool = True) -> dict | None:
+def handle_call(bot, store: Store, path: Path, notify: bool = True, provider: str | None = None) -> dict | None:
     """통화 녹음 1건을 처리한다. 실패하면 실패 항목을 남기고 돌려준다(성공하면 None).
 
     어디서 실패하든 조용히 사라지지 않게 DB에 남기고, notify면 슬랙으로도 알린다.
     """
     with _call_lock:
         try:
-            _process_call(bot, store, path)
+            _process_call(bot, store, path, provider)
         except pipeline.ProcessError as e:  # 전사와 원문 저장은 끝났고 정리만 실패
             store.resolve_failures(stage="call", target=str(path))
             failure = e.failure
@@ -140,13 +142,14 @@ def main() -> None:
         watcher = CallWatcher(cfg.call_dir, store, lambda p: handle_call(bot, store, p),
                               baseline=float(baseline), on_missed=bot.post_missed)
         bot.watcher = watcher
-        bot.process_call = lambda p, notify=True: handle_call(bot, store, p, notify)
+        bot.process_call = lambda p, notify=True, provider=None: handle_call(bot, store, p, notify, provider)
         threading.Thread(target=watcher.run_forever, daemon=True, name="calls").start()
     else:
         log.info("CALL_DIR 미설정: 통화 녹음 감시를 끕니다")
     threading.Thread(target=digest_loop, args=(bot, store), daemon=True, name="digest").start()
 
-    log.info("두괄이 시작. 슬랙에서 봇에게 DM을 보내 보세요.")
+    log.info("두괄이 시작 (LLM: %s, 전사: %s, 통화 전사문 자동 전송: %s). 슬랙에서 봇에게 DM을 보내 보세요.",
+             cfg.llm_provider, cfg.stt_provider, "켜짐" if cfg.send_calls_to_llm else "꺼짐")
     SocketModeHandler(bot.app, cfg.slack_app_token).start()
 
 

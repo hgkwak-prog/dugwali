@@ -371,7 +371,7 @@ def test_call_failure_is_recorded_notified_and_retryable(store, fake_llm, tmp_pa
 
     state = {"broken": True}
 
-    def fake_transcribe(path, speakers=2, diarize=None):
+    def fake_transcribe(path, speakers=2, diarize=None, provider=None):
         if state["broken"]:
             raise RuntimeError("모델 로드 실패")
         return {"text": "화자1: 견적 건입니다", "duration": 60.0, "elapsed": 5.0, "diarized": False}
@@ -394,7 +394,7 @@ def test_call_is_not_lost_when_slack_post_fails(store, fake_llm, tmp_path, monke
     import dugwali.stt.transcribe as stt
 
     calls = []
-    monkeypatch.setattr(stt, "transcribe", lambda path, speakers=2, diarize=None: calls.append(path) or {
+    monkeypatch.setattr(stt, "transcribe", lambda path, speakers=2, diarize=None, provider=None: calls.append(path) or {
         "text": "화자1: 견적 건입니다", "duration": 60.0, "elapsed": 5.0, "diarized": False})
     monkeypatch.setattr(cfg, "send_calls_to_llm", True)
     cfg.ensure_dirs()
@@ -472,7 +472,9 @@ def test_slack_attention_blocks_list_failures_pending_and_missed(store, broken_l
     store.resolve_failures(fid=store.open_failures()[0]["id"])
     pipeline.delete(store, 1)
     pipeline.delete(store, 2)
-    assert slack_ui.attention_blocks(store)[0]["text"]["text"] == "조치할 것이 없습니다."
+    clear = slack_ui.attention_blocks(store, None)[0]["text"]["text"]
+    assert clear.startswith("막힌 건이 없습니다. (처리 실패 0건 · 정리 안 된 기록 0건 · 놓친 통화 녹음 확인 안 함(감시 꺼짐))")
+    assert "놓친 통화 녹음 0개" in slack_ui.attention_blocks(store, [])[0]["text"]["text"]
 
 
 class FakeClient:
@@ -555,7 +557,7 @@ def test_slack_attention_list_retries_and_refreshes(bot, store, broken_llm):
     assert set(client.actions("3.0")) == {"pending_summarize", "pending_delete"}   # 목록은 줄어든다
     bot.click("pending_summarize", "3.0")
     assert "fmt_slack" in client.actions("2.0")
-    assert client.messages["3.0"]["blocks"][0]["text"]["text"] == "조치할 것이 없습니다."
+    assert client.messages["3.0"]["blocks"][0]["text"]["text"].startswith("막힌 건이 없습니다.")
 
 
 def test_slack_dismiss_keeps_raw_record_listed(bot, store, broken_llm):
@@ -563,3 +565,217 @@ def test_slack_dismiss_keeps_raw_record_listed(bot, store, broken_llm):
     bot.click("dismiss_failure", "1.0")
     assert store.open_failures() == [] and "정리 안 된 기록" in bot.app.client.messages["1.0"]["text"]
     assert len(digest.attention(store)[1]) == 1
+
+
+# ---------- 전사·LLM 방식 선택 ----------
+
+def test_llm_retries_transient_failure_once_but_not_config_errors(monkeypatch):
+    calls = []
+
+    def flaky(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise llm.LLMError("일시 오류")
+        return '{"ok": true}'
+
+    monkeypatch.setitem(llm._PROVIDERS, "claude_code", flaky)
+    assert llm.call_json("p") == {"ok": True} and len(calls) == 2
+
+    def always(prompt):
+        calls.append(prompt)
+        raise llm.LLMError("계속 오류")
+
+    monkeypatch.setitem(llm._PROVIDERS, "claude_code", always)
+    with pytest.raises(llm.LLMError):
+        llm.call_json("p")
+    assert len(calls) == 4                              # 처음 + 재시도 1회
+
+    def missing(prompt):
+        calls.append(prompt)
+        raise llm.LLMConfigError("설치 안 됨")
+
+    monkeypatch.setitem(llm._PROVIDERS, "claude_code", missing)
+    with pytest.raises(llm.LLMConfigError):
+        llm.call_json("p")
+    assert len(calls) == 5                              # 설정 문제는 다시 시도하지 않는다
+    monkeypatch.setattr(cfg, "llm_provider", "gpt")
+    with pytest.raises(llm.LLMConfigError):
+        llm.call_json("p")
+
+
+def test_llm_api_provider_builds_request_and_reads_text(monkeypatch):
+    import sys
+    import types
+
+    seen = {}
+
+    class Block:
+        def __init__(self, type_, text=""):
+            self.type, self.text = type_, text
+
+    class Resp:
+        stop_reason = "end_turn"
+        content = [Block("thinking"), Block("text", '{"ok": true}')]
+
+    class Messages:
+        def create(self, **kw):
+            seen["req"] = kw
+            return Resp()
+
+    class Client:
+        def __init__(self, **opts):
+            seen["opts"] = opts
+            self.messages = Messages()
+            self.beta = types.SimpleNamespace(messages=Messages())
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = Client
+    for name in ("AuthenticationError", "PermissionDeniedError", "NotFoundError", "RateLimitError",
+                 "APIStatusError", "APIConnectionError", "AnthropicError"):
+        setattr(fake, name, type(name, (Exception,), {}))
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(cfg, "llm_provider", "api")
+    monkeypatch.setattr(cfg, "llm_api_key", "k")
+    assert llm.call_json("프롬프트") == {"ok": True}
+    req = seen["req"]
+    assert seen["opts"]["api_key"] == "k" and req["model"] == "claude-opus-5-5"
+    assert req["messages"] == [{"role": "user", "content": "프롬프트"}] and req["system"] == llm.SYSTEM_PROMPT
+    assert req["output_config"] == {"effort": "low"} and req["fallbacks"] == "default"
+    assert "temperature" not in req and "thinking" not in req
+
+    monkeypatch.setattr(cfg, "llm_api_base_url", "https://llm.example.internal")   # 사내 게이트웨이
+    llm.call_json("p")
+    assert seen["opts"]["base_url"] == "https://llm.example.internal" and "fallbacks" not in seen["req"]
+
+    Resp.stop_reason = "refusal"
+    with pytest.raises(llm.LLMConfigError):
+        llm.call_json("p")
+
+
+def test_daily_llm_limit_keeps_raw_and_lists_it(store, fake_llm, monkeypatch):
+    monkeypatch.setattr(cfg, "llm_daily_limit", 2)
+    pipeline.process(store, "하나")
+    pipeline.process(store, "둘")
+    with pytest.raises(pipeline.ProcessError) as e:
+        pipeline.process(store, "셋")
+    assert "상한(2회)" in str(e.value) and len(fake_llm) == 2
+    assert store.get_record(e.value.record["id"])["raw_text"] == "셋" and len(store.open_failures()) == 1
+    store.set_state("llm_calls", '{"day": "2000-01-01", "n": 2}')   # 날짜가 바뀌면 다시 센다
+    assert pipeline.summarize(store, e.value.record["id"])["data"] and len(fake_llm) == 3
+    monkeypatch.setattr(cfg, "llm_daily_limit", 0)                  # 0이면 무제한
+    pipeline.process(store, "넷")
+
+
+def test_stt_api_sends_file_without_original_name(tmp_path, monkeypatch):
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    import dugwali.stt.transcribe as stt
+
+    got = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            got["path"], got["auth"] = self.path, self.headers["Authorization"]
+            got["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+            status, payload = (500, {"error": "boom"}) if got.get("fail") else (200, {"text": " 견적 건입니다 ",
+                                                                                      "duration": 12.5})
+            out = _json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        audio = tmp_path / "김과장_01012345678.m4a"
+        audio.write_bytes(b"AUDIOBYTES")
+        monkeypatch.setattr(cfg, "stt_provider", "api")
+        monkeypatch.setattr(cfg, "stt_api_base_url", f"http://127.0.0.1:{server.server_port}/v1")
+        with pytest.raises(RuntimeError, match="STT_API_KEY"):
+            stt.transcribe(str(audio))
+        monkeypatch.setattr(cfg, "stt_api_key", "sk-test")
+        r = stt.transcribe(str(audio))
+        assert r == {"text": "견적 건입니다", "duration": 12.5, "elapsed": r["elapsed"], "diarized": False,
+                     "provider": "api"}
+        assert got["path"] == "/v1/audio/transcriptions" and got["auth"] == "Bearer sk-test"
+        body = got["body"]
+        assert b"AUDIOBYTES" in body and b'name="model"\r\n\r\nwhisper-1' in body and b'name="language"' in body
+        assert b'filename="audio.m4a"' in body and "김과장".encode() not in body and b"01012345678" not in body
+        got["fail"] = True
+        with pytest.raises(RuntimeError, match="전사 API 오류 500"):
+            stt.transcribe(str(audio))
+    finally:
+        server.shutdown()
+    with pytest.raises(ValueError):
+        stt.transcribe(str(audio), provider="cloud")
+
+
+@pytest.fixture
+def voice(bot, monkeypatch, tmp_path):
+    """음성 파일이 붙은 DM을 보낸다. state["error"]가 있으면 전사가 그 오류로 실패한다."""
+    import dugwali.stt.transcribe as stt
+
+    state = {"error": None, "providers": []}
+
+    def fake_transcribe(path, speakers=2, diarize=None, provider=None):
+        state["providers"].append(provider)
+        if state["error"] and provider != "local":
+            raise RuntimeError(state["error"])
+        return {"text": "내일까지 견적서 보내기", "duration": 5.0, "elapsed": 1.0, "diarized": False,
+                "provider": provider or "local"}
+
+    monkeypatch.setattr(stt, "transcribe", fake_transcribe)
+    monkeypatch.setattr(bot, "_download", lambda f: tmp_path / "memo.m4a")
+
+    def send(text=""):
+        bot.app.handlers["message"]({"channel_type": "im", "user": "U1", "channel": "D1", "ts": "100.0",
+                                     "text": text, "files": [{"id": "F1", "name": "memo.m4a"}]}, bot.app.client)
+
+    state["send"] = send
+    return state
+
+
+def test_voice_memo_waits_for_approval_by_default(bot, store, voice, fake_llm):
+    voice["send"]("메모")
+    assert fake_llm == [] and store.get_record(1)["raw_text"] == "메모\n내일까지 견적서 보내기"
+    assert set(bot.app.client.actions("1.0")) == {"summarize_call", "delete_record"}   # 통화와 같은 게이트
+    bot.click("summarize_call", "1.0")
+    assert "fmt_slack" in bot.app.client.actions("1.0") and len(fake_llm) == 1
+
+
+def test_voice_memo_goes_straight_through_when_sending_is_approved(bot, store, voice, fake_llm, monkeypatch):
+    monkeypatch.setattr(cfg, "send_calls_to_llm", True)
+    voice["send"]()
+    assert "fmt_slack" in bot.app.client.actions("1.0") and store.get_record(1)["source"] == "voice"
+
+
+def test_voice_transcription_failure_is_listed_and_can_fall_back_to_local(bot, store, voice, fake_llm, monkeypatch):
+    monkeypatch.setattr(cfg, "send_calls_to_llm", True)
+    monkeypatch.setattr(cfg, "stt_provider", "api")
+    monkeypatch.setattr(slack_ui, "local_available", lambda: True)
+    voice["error"] = "전사 API 오류 500"
+    voice["send"]()
+    client = bot.app.client
+    assert set(client.actions("1.0")) == {"retry_failure", "retry_failure_local", "dismiss_failure"}
+    (f,) = store.open_failures()
+    assert f["stage"] == "voice" and digest.attention(store) == ([f], [])   # 조치 목록에 실패로 한 번만 나온다
+    bot.click("retry_failure", "1.0")
+    assert store.open_failures()[0]["attempts"] == 2
+    bot.click("retry_failure_local", "1.0")
+    assert voice["providers"] == [None, None, "local"]
+    assert "fmt_slack" in client.actions("1.0") and store.open_failures() == []
+
+
+def test_dismissing_untranscribed_voice_memo_drops_the_empty_record(bot, store, voice):
+    voice["error"] = "모델 로드 실패"
+    voice["send"]()
+    assert "retry_failure_local" not in bot.app.client.actions("1.0")       # 로컬 방식이면 버튼이 하나뿐
+    bot.click("dismiss_failure", "1.0")
+    assert store.get_record(1) is None and digest.attention(store) == ([], [])
+    assert "음성 파일은 그대로" in bot.app.client.messages["1.0"]["text"]

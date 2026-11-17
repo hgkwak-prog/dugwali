@@ -1,0 +1,2 @@
+# LLM_PROVIDER=api (Claude API)일 때만 필요
+anthropic>=1.0

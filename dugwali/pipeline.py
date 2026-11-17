@@ -6,10 +6,13 @@
 기록(메모·통화 1개)은 건(같은 일의 묶음)에 속한다. 새 기록은 새 건으로 시작하고,
 관련 건은 제안만 한다(`data["related_case"]`). 합치는 것은 사용자가 정한다.
 """
+import json
 import logging
+from datetime import date
 
 from .agent import extract as ex
-from .agent.llm import LLMError
+from .agent.llm import LLMError, LLMLimitError
+from .config import cfg
 from .labels import SOURCE_LABEL
 from .sinks import markdown as md_sink
 from .store import UNTITLED, Store
@@ -17,6 +20,20 @@ from .store import UNTITLED, Store
 log = logging.getLogger(__name__)
 SUGGEST_DAYS = 14   # 이 기간 안에 갱신된 건만 관련 건 후보로 보낸다
 SUGGEST_MAX = 20
+
+
+def _extract(store: Store, text: str, source: str, cases: list[tuple[int, str]] | None = None) -> dict:
+    """LLM 호출은 모두 여기를 지난다. 하루 호출 상한(LLM_DAILY_LIMIT, 0이면 무제한)을 센다."""
+    limit = cfg.llm_daily_limit
+    if limit > 0:
+        today = date.today().isoformat()
+        used = json.loads(store.get_state("llm_calls") or "{}")
+        n = used.get("n", 0) if used.get("day") == today else 0
+        if n >= limit:
+            raise LLMLimitError(f"오늘 LLM 호출 상한({limit}회)에 닿았습니다. 내일 다시 시도하거나 "
+                                ".env의 LLM_DAILY_LIMIT을 올리세요.")
+        store.set_state("llm_calls", json.dumps({"day": today, "n": n + 1}))
+    return ex.extract(text, source, cases=cases)
 
 
 def _label(source: str) -> str:
@@ -70,7 +87,7 @@ def _structure(store: Store, rid: int) -> None:
     """저장된 기록의 원문을 구조화해 채운다. 실패하면 실패 항목을 남기고 ProcessError를 던진다."""
     rec = store.get_record(rid)
     try:
-        data = ex.extract(rec["raw_text"], _label(rec["source"]), cases=_candidates(store, rec["case_id"]))
+        data = _extract(store, rec["raw_text"], _label(rec["source"]), _candidates(store, rec["case_id"]))
     except LLMError as e:
         log.warning("기록 %s 정리 실패: %s", rid, e)
         raise ProcessError(rec, store.record_failure("extract", _target(rid), str(e), rid), e) from e
@@ -105,7 +122,7 @@ def amend(store: Store, rid: int, extra: str) -> dict:
     """스레드 답글로 들어온 보충 정보를 합쳐 다시 구조화한다."""
     rec = store.get_record(rid)
     raw = f"{rec['raw_text']}\n\n[작성자 보충] {extra}"
-    data = ex.extract(raw, _label(rec["source"]))
+    data = _extract(store, raw, _label(rec["source"]))
     store.update_record(rid, raw_text=raw, data=data)
     _reconcile(store, rec["case_id"])
     _refresh(store, {rec["created_at"][:10]}, {rec["case_id"]})
@@ -169,7 +186,7 @@ def case_summary(store: Store, cid: int) -> dict | None:
     done = store.done_tasks(cid)
     if done:
         text += "\n\n[이미 완료 처리한 할 일 - todos에 넣지 말 것]\n" + "\n".join(f"- {t}" for t in done)
-    data = ex.extract(text, "한 건의 여러 기록(시간순)")
+    data = _extract(store, text, "한 건의 여러 기록(시간순)")
     store.set_case_summary(cid, data)
     _refresh(store, {r["created_at"][:10] for r in recs}, {cid})
     return data
