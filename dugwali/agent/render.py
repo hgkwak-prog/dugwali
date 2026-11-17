@@ -1,4 +1,24 @@
-"""공통 스키마 → 용도별 양식. LLM을 쓰지 않는 순수 템플릿이라 구독 사용량을 먹지 않는다."""
+"""공통 스키마 → 용도별 양식. LLM을 쓰지 않는 순수 템플릿이라 구독 사용량을 먹지 않는다.
+
+슬랙·메일 양식의 항목 순서와 메일 인사말·맺음말은 개인 프로필(`profile.md`의 `## 양식`)을 따른다.
+결론은 항상 맨 위에 온다. 업무 로그(Markdown)는 기록이므로 프로필과 무관하게 모든 항목을 남긴다.
+"""
+from .. import profile as profile_mod
+
+
+def _items(d: dict, name: str) -> list[str]:
+    """프로필의 항목 이름 → 그 항목의 줄들."""
+    if name == "결정":
+        return d["decisions"]
+    if name == "할 일":
+        return [_todo_line(t) for t in d["todos"]]
+    if name == "확인 필요":
+        return d["open_questions"]
+    if name == "배경":
+        return d["background"]
+    if name == "복귀 지점":
+        return [d["resume_point"]] if d.get("resume_point") else []
+    return []
 
 
 def _todo_line(t: dict) -> str:
@@ -16,30 +36,34 @@ def _bullets(items: list[str], bullet: str = "•") -> str:
     return "\n".join(f"{bullet} {x}" for x in items)
 
 
-def slack(d: dict) -> str:
+def slack(d: dict, profile: profile_mod.Profile | None = None) -> str:
     """슬랙 공유용: 결론 한 줄 + 개조식."""
+    profile = profile or profile_mod.load()
     head = f"*[{d['kind']}] {d['title']}*"
     if d.get("counterpart"):
         head += f" · {d['counterpart']}"
     parts = [head, f"*결론* {d['conclusion']}"]
-    if d["decisions"]:
-        parts.append("*결정*\n" + _bullets(d["decisions"]))
-    if d["todos"]:
-        parts.append("*할 일*\n" + _bullets([_todo_line(t) for t in d["todos"]]))
-    if d["open_questions"]:
-        parts.append("*확인 필요*\n" + _bullets(d["open_questions"]))
-    if d.get("resume_point"):
-        parts.append(f"*복귀 지점* {d['resume_point']}")
+    for name in profile.slack_order:
+        items = _items(d, name)
+        if not items:
+            continue
+        if name == "복귀 지점":
+            parts.append(f"*복귀 지점* {items[0]}")
+        else:
+            parts.append(f"*{name}*\n" + _bullets(items))
     return "\n".join(parts)
 
 
-def mail(d: dict) -> str:
+_MAIL_LABEL = {"결정": "결정 사항", "확인 필요": "확인 필요 사항"}
+
+
+def mail(d: dict, profile: profile_mod.Profile | None = None) -> str:
     """메일 양식: 제목에 결론, 본문 두괄식."""
-    to = d.get("share_to") or "○○○"
+    profile = profile or profile_mod.load()
     lines = [
         f"제목: [{d['kind']}] {d['title']}",
         "",
-        f"{to}님, 안녕하세요.",
+        profile.greeting(d.get("share_to")),
         "",
         f"{d['title']} 건 공유드립니다.",
         "",
@@ -47,16 +71,12 @@ def mail(d: dict) -> str:
         f"  - {d['conclusion']}",
     ]
     n = 2
-    for label, items in (
-        ("결정 사항", d["decisions"]),
-        ("할 일", [_todo_line(t) for t in d["todos"]]),
-        ("확인 필요 사항", d["open_questions"]),
-        ("배경", d["background"]),
-    ):
+    for name in profile.mail_order:
+        items = _items(d, name)
         if items:
-            lines += ["", f"{n}. {label}"] + [f"  - {x}" for x in items]
+            lines += ["", f"{n}. {_MAIL_LABEL.get(name, name)}"] + [f"  - {x}" for x in items]
             n += 1
-    lines += ["", "감사합니다."]
+    lines += ["", profile.mail_closing]
     return "\n".join(lines)
 
 

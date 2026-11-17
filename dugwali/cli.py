@@ -9,12 +9,14 @@
   python -m dugwali.cli delete 5                 # 5번 기록 삭제
   python -m dugwali.cli attention                # 처리 실패, 정리 안 된 기록
   python -m dugwali.cli retry 5                  # 5번 기록을 다시 정리
+  python -m dugwali.cli profile                  # 프로필이 어떻게 읽혔는지 확인
+  python -m dugwali.cli profile --init sales-pm  # 예시 프로필로 시작
   python -m dugwali.cli check                    # claude 헤드리스 호출 점검
 """
 import argparse
 import sys
 
-from . import digest, pipeline
+from . import digest, pipeline, profile
 from .agent import llm, render
 from .config import cfg
 from .store import Store
@@ -38,6 +40,9 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("case_id", type=int)
     d_ = sub.add_parser("delete", help="기록 삭제")
     d_.add_argument("record_id", type=int)
+    pr = sub.add_parser("profile", help="개인 프로필 확인·만들기")
+    pr.add_argument("--init", nargs="?", const="default", metavar="예시",
+                    help=f"예시 프로필을 복사해 시작 ({', '.join(profile.examples()) or '예시 없음'})")
     sub.add_parser("attention", help="처리 실패와 정리 안 된 기록")
     r_ = sub.add_parser("retry", help="정리에 실패했거나 보관만 한 기록을 다시 정리")
     r_.add_argument("record_id", type=int)
@@ -72,6 +77,16 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "delete":
         rec = pipeline.delete(Store(cfg.db_path), args.record_id)
         print(f"기록 {args.record_id} 삭제" if rec else "그런 기록이 없습니다.")
+    elif args.cmd == "profile":
+        if args.init:
+            try:
+                print(f"프로필을 만들었습니다: {profile.init(args.init)}\n메모장으로 열어 내 상황에 맞게 고치세요.\n")
+            except (ValueError, FileExistsError) as e:
+                print(e)
+                return 1
+        print(profile.describe())
+        if not profile.load().exists:
+            print(f"\n시작하려면: python -m dugwali.cli profile --init [{' | '.join(profile.examples())}]")
     elif args.cmd == "attention":
         failures, pending = digest.attention(Store(cfg.db_path))
         for f in failures:

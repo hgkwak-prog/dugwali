@@ -22,6 +22,7 @@ class Config:
         self.transcript_dir = Path(
             os.getenv("TRANSCRIPT_DIR", str(self.data_dir / "transcripts"))
         )
+        self._profile_path = os.getenv("PROFILE_PATH", "").strip()
         call_dir = os.getenv("CALL_DIR", "").strip()
         self.call_dir = Path(call_dir) if call_dir else None
 
@@ -52,6 +53,11 @@ class Config:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "dugwali.sqlite3"
+
+    @property
+    def profile_path(self) -> Path:
+        """정리 기준을 적는 개인 프로필. 기본은 데이터 폴더의 profile.md."""
+        return Path(self._profile_path) if self._profile_path else self.data_dir / "profile.md"
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.log_dir, self.transcript_dir):

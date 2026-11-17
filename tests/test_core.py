@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 import pytest
 
-from dugwali import app, digest, pipeline
+from dugwali import app, digest, pipeline, profile
 from dugwali.agent import extract, llm, render
 from dugwali.config import cfg
 from dugwali.ingest.watcher import CallWatcher
@@ -31,6 +31,13 @@ SAMPLE = {
     "share_to": "박팀장",
     "ask_user": ["견적서는 누구 검토를 받아야 하나요?"],
 }
+
+
+@pytest.fixture(autouse=True)
+def no_personal_profile(tmp_path, monkeypatch):
+    """테스트는 이 PC의 실제 프로필과 무관하게 기본값으로 돈다."""
+    monkeypatch.setattr(cfg, "_profile_path", str(tmp_path / "profile.md"))
+    return tmp_path / "profile.md"
 
 
 @pytest.fixture
@@ -779,3 +786,79 @@ def test_dismissing_untranscribed_voice_memo_drops_the_empty_record(bot, store, 
     bot.click("dismiss_failure", "1.0")
     assert store.get_record(1) is None and digest.attention(store) == ([], [])
     assert "음성 파일은 그대로" in bot.app.client.messages["1.0"]["text"]
+
+
+# ---------- 개인 프로필 ----------
+
+PROFILE = """# 내 프로필
+<!-- 이 주석은 LLM에 가지 않는다 -->
+## 나
+- 역할: 기업교육 PM
+
+## 말투
+- 문장은 "~합니다"로 끝내기
+
+## 양식
+- 슬랙 순서: 할 일, 결정
+- 메일 순서 : 결론 → 할 일
+- 메일 인사말: 안녕하세요, 비즈팀입니다. {대상}님께 공유드립니다.
+- 메일 맺음말: 고맙습니다.
+- 슬랙 색깔: 파랑
+- 메일 순서: 요약
+"""
+
+
+def test_profile_defaults_keep_current_output(no_personal_profile):
+    p = profile.load()
+    assert not p.exists and p.warnings == [] and list(p.sections) == ["말투"]
+    assert "명사형 종결" in p.prompt_text and "기본값 사용" in profile.describe()
+
+
+def test_profile_file_changes_prompt_and_formats(no_personal_profile, fake_llm):
+    no_personal_profile.write_text(PROFILE, encoding="utf-8")
+    p = profile.load()
+    assert list(p.sections) == ["말투", "나"] and "~합니다" in p.sections["말투"]      # 내 말투가 기본값을 대신한다
+    assert p.slack_order == ["할 일", "결정"] and p.mail_order == ["할 일"]
+    assert len(p.warnings) == 2 and "슬랙 색깔" in p.warnings[0] and "'요약'" in p.warnings[1]
+
+    extract.extract("메모")
+    prompt = fake_llm[0]
+    assert "[작성자 프로필]" in prompt and "역할: 기업교육 PM" in prompt and "~합니다" in prompt
+    assert "주석" not in prompt and "슬랙 순서" not in prompt and "인턴" not in prompt
+    assert "명사형 종결" not in prompt
+
+    d = extract.normalize(SAMPLE)
+    s = render.slack(d)
+    assert s.index("결론") < s.index("할 일") < s.index("결정") and "확인 필요" not in s
+    m = render.mail(d).splitlines()
+    assert m[2] == "안녕하세요, 비즈팀입니다. 박팀장님께 공유드립니다." and m[-1] == "고맙습니다."
+    assert "2. 할 일" in m and not any("결정 사항" in x or "배경" in x for x in m)
+    assert "**결정**" in render.markdown(d, "10:00", "슬랙 메모")       # 업무 로그는 항목을 빼지 않는다
+
+    time.sleep(0.01)
+    no_personal_profile.write_text("## 양식\n- 메일 맺음말: 수고하세요.\n", encoding="utf-8")
+    os.utime(no_personal_profile, (time.time() + 5, time.time() + 5))
+    assert render.mail(d).splitlines()[-1] == "수고하세요."            # 파일을 고치면 재시작 없이 반영된다
+
+
+def test_profile_init_copies_example_once(no_personal_profile):
+    assert {"default", "sales-pm", "developer"} <= set(profile.examples())
+    assert profile.init("sales-pm") == no_personal_profile
+    p = profile.load()
+    assert p.exists and p.warnings == [] and p.slack_order == ["할 일", "결정", "확인 필요"]
+    with pytest.raises(FileExistsError):
+        profile.init("default")
+    with pytest.raises(ValueError):
+        profile.init("없는예시")
+    for name in profile.examples():                                   # 예시는 모두 경고 없이 읽혀야 한다
+        text = (profile.EXAMPLES_DIR / f"{name}.md").read_text(encoding="utf-8")
+        assert profile.parse(text, no_personal_profile).warnings == []
+
+
+def test_slack_profile_command_shows_how_it_was_read(bot, no_personal_profile):
+    bot.say("프로필")
+    assert "기본값 사용" in bot.app.client.messages["1.0"]["text"]
+    no_personal_profile.write_text(PROFILE, encoding="utf-8")
+    bot.say("프로필", ts="101.0")
+    text = bot.app.client.messages["2.0"]["text"]
+    assert "슬랙 순서: 결론 → 할 일 → 결정" in text and "⚠️" in text

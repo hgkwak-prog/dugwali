@@ -13,7 +13,7 @@ from pathlib import Path
 
 from slack_bolt import App
 
-from .. import digest, pipeline
+from .. import digest, pipeline, profile
 from ..agent import render
 from ..config import cfg
 from ..labels import SOURCE_LABEL
@@ -30,7 +30,8 @@ HELP = (
     "• 같은 일에 대한 기록은 초안의 *합치기* 버튼으로 한 건으로 묶습니다. 일이 끝난 뒤의 후속 메모도 같은 방법으로 붙입니다.\n"
     "• 음성 메모 파일을 올리면 받아써서 정리합니다.\n"
     "• `건` 진행 중인 건 목록(통합 정리·종결·삭제) · `할일` 미완료 목록 · `오늘` 오늘 정리\n"
-    "• `조치` 처리에 실패했거나 아직 정리 안 된 기록, 놓친 통화 녹음 · `도움말`"
+    "• `조치` 처리에 실패했거나 아직 정리 안 된 기록, 놓친 통화 녹음\n"
+    "• `프로필` 내 정리 기준(profile.md)이 어떻게 읽혔는지 · `도움말`"
 )
 MAX_CASES_LISTED = 15
 MAX_ATTENTION_LISTED = 10
@@ -399,6 +400,12 @@ class Bot:
             if text in ("조치", "조치 필요", "실패"):
                 client.chat_postMessage(channel=channel, text="조치 필요",
                                         blocks=attention_blocks(store, self._missed()))
+                return
+            if text in ("프로필", "profile"):
+                p = profile.load()
+                hint = "" if p.exists else ("\n프로필 파일이 없어 기본값으로 정리합니다. 만들려면 PC에서 "
+                                            "`python -m dugwali.cli profile --init`을 실행하세요.")
+                client.chat_postMessage(channel=channel, text=f"```{profile.describe(p)}```{hint}")
                 return
             if text in ("도움말", "help", "?"):
                 client.chat_postMessage(channel=channel, text=HELP)
