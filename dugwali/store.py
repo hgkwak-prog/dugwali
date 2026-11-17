@@ -57,6 +57,14 @@ CREATE TABLE IF NOT EXISTS failures (
     resolved_at TEXT
 );
 CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    agent TEXT
+);
 CREATE TABLE IF NOT EXISTS corrections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -526,6 +534,41 @@ class Store:
         with self._lock:
             return [dict(r) for r in self._db.execute(
                 "SELECT * FROM corrections ORDER BY id DESC LIMIT ?", (limit,))]
+
+    # --- sessions (다른 기기에서 대시보드에 로그인한 브라우저) ---
+    def add_session(self, token_hash: str, agent: str, days: int) -> int:
+        now = datetime.now()
+        with self._lock, self._db:
+            return self._db.execute(
+                "INSERT INTO sessions (token_hash, created_at, last_seen, expires_at, agent) VALUES (?,?,?,?,?)",
+                (token_hash, now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"),
+                 (now + timedelta(days=days)).isoformat(timespec="seconds"), agent[:200])).lastrowid
+
+    def get_session(self, token_hash: str) -> dict | None:
+        """유효한(기한이 남은) 세션. 1분에 한 번만 마지막 접속 시각을 갱신한다."""
+        now = _now()
+        with self._lock, self._db:
+            r = self._db.execute("SELECT * FROM sessions WHERE token_hash=? AND expires_at > ?",
+                                 (token_hash, now)).fetchone()
+            if r and r["last_seen"][:16] != now[:16]:
+                self._db.execute("UPDATE sessions SET last_seen=? WHERE id=?", (now, r["id"]))
+        return dict(r) if r else None
+
+    def list_sessions(self) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._db.execute(
+                "SELECT * FROM sessions WHERE expires_at > ? ORDER BY last_seen DESC", (_now(),))]
+
+    def delete_session(self, sid: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+    def delete_sessions(self, expired_only: bool = False) -> int:
+        """세션을 지운다(전체 로그아웃). expired_only면 기한이 지난 것만. 지운 수를 돌려준다."""
+        with self._lock, self._db:
+            cur = (self._db.execute("DELETE FROM sessions WHERE expires_at <= ?", (_now(),)) if expired_only
+                   else self._db.execute("DELETE FROM sessions"))
+            return cur.rowcount
 
     # --- seen files ---
     def is_seen(self, path: str) -> bool:

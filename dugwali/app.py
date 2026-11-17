@@ -110,6 +110,7 @@ def purge_tick(store: Store, now: datetime) -> int:
     if store.get_state("trash_purged_on") == today:
         return 0
     n = store.purge_trash()
+    store.delete_sessions(expired_only=True)
     store.set_state("trash_purged_on", today)
     if n:
         log.info("휴지통에서 오래된 기록 %d건을 완전히 지웠습니다", n)
@@ -162,7 +163,8 @@ def main() -> None:
         log.info("CALL_DIR 미설정: 통화 녹음 감시를 끕니다")
     threading.Thread(target=digest_loop, args=(bot, store), daemon=True, name="digest").start()
     if cfg.dashboard_port:
-        bot.dashboard_url = Dashboard(store, bot).start()
+        bot.dashboard = Dashboard(store, bot)
+        bot.dashboard_url = bot.dashboard.start()
 
     log.info("두괄이 시작 (LLM: %s, 전사: %s, 통화 전사문 자동 전송: %s). 슬랙에서 봇에게 DM을 보내 보세요.",
              cfg.llm_provider, cfg.stt_provider, "켜짐" if cfg.send_calls_to_llm else "꺼짐")

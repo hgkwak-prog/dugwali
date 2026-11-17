@@ -1274,3 +1274,113 @@ def test_slack_draft_follows_dashboard_edits(bot, store, llm_out):
     assert "fmt_slack" in client.actions("1.0")                       # 되살리면 초안도 돌아온다
     bot.click("delete_record", "1.0")
     assert store.get_record(1)["deleted_at"] and "되살릴 수 있습니다" in client.messages["1.0"]["text"]
+
+
+# ---------- 다른 기기에서 대시보드 열기 (슬랙 일회용 링크) ----------
+
+@pytest.fixture
+def remote(dash, monkeypatch):
+    """Tailscale serve 같은 프록시를 거쳐 들어온 요청을 흉내 낸다."""
+    import http.client
+    import urllib.parse
+
+    monkeypatch.setattr(cfg, "dashboard_url", "https://pc.tail1234.ts.net")
+    proxy = {"Host": "pc.tail1234.ts.net", "X-Forwarded-For": "100.64.0.2", "User-Agent": "Phone Safari"}
+
+    def req(method, path, cookie="", **form):
+        c = http.client.HTTPConnection("127.0.0.1", dash.port, timeout=5)
+        headers = dict(proxy, Cookie=cookie) if cookie else dict(proxy)
+        body = None
+        if method == "POST":
+            body = urllib.parse.urlencode(form)
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        c.request(method, path, body, headers)
+        r = c.getresponse()
+        return r.status, r.read().decode("utf-8"), r.getheader("Set-Cookie") or "", r.getheader("Location")
+
+    dash.req = req
+    return dash
+
+
+def test_remote_requests_are_refused_unless_remote_is_enabled(dash, store, monkeypatch):
+    import http.client
+
+    c = http.client.HTTPConnection("127.0.0.1", dash.port, timeout=5)
+    c.request("GET", "/", headers={"Host": f"127.0.0.1:{dash.port}", "X-Forwarded-For": "100.64.0.2"})
+    assert c.getresponse().status == 403                              # 프록시를 거친 요청은 DASHBOARD_URL 없이는 거절
+    assert dash.login_link() is None
+
+
+def test_remote_login_with_one_time_slack_link(remote, store, fake_llm):
+    pipeline.process(store, "메모")
+    status, html, _, _ = remote.req("GET", "/")
+    assert status == 401 and "슬랙에서 두괄이에게 <b>대시보드</b>를 보내" in html and "견적서" not in html
+    assert remote.req("POST", f"/todos/1/done", token=remote.token)[0] == 401   # 화면 토큰만으로는 못 쓴다
+
+    link = remote.login_link()
+    assert link.startswith("https://pc.tail1234.ts.net/login?code=")
+    code = link.split("code=")[1]
+    status, html, _, _ = remote.req("GET", f"/login?code={code}")
+    assert status == 200 and "로그인</button>" in html and store.list_sessions() == []   # 링크를 여는 것만으로는 로그인 안 됨
+    status, _, cookie, loc = remote.req("POST", "/login", code=code)
+    assert status == 303 and loc == "/" and "HttpOnly" in cookie and "Secure" in cookie and "SameSite=Lax" in cookie
+    session = cookie.split(";")[0]
+    assert remote.req("POST", "/login", code=code)[0] == 401          # 한 번만 쓸 수 있다
+    assert remote.req("POST", "/login", code="guess")[0] == 401
+
+    status, html, _, _ = remote.req("GET", "/", cookie=session)
+    assert status == 200 and "견적서 재요청" in html and "접속 관리" in html
+    (s,) = store.list_sessions()
+    assert s["agent"] == "Phone Safari" and len(s["token_hash"]) == 64 and session.split("=")[1] not in s["token_hash"]
+    tid = store.open_todos()[0]["id"]
+    assert remote.req("POST", f"/todos/{tid}/done", cookie=session, token=remote.token)[0] == 303
+    assert len(store.open_todos()) == 1
+
+
+def test_login_link_expires(remote, monkeypatch):
+    import dugwali.web as web
+
+    link = remote.login_link()
+    now = time.time()
+    monkeypatch.setattr(web.time, "time", lambda: now + web.LOGIN_CODE_MINUTES * 60 + 1)
+    assert remote.req("POST", "/login", code=link.split("code=")[1])[0] == 401
+
+
+def test_session_logout_from_dashboard_and_slack(remote, store, bot):
+    def login():
+        code = remote.login_link().split("code=")[1]
+        return remote.req("POST", "/login", code=code)[2].split(";")[0]
+
+    a, b = login(), login()
+    _, html, _, _ = remote.req("GET", "/sessions", cookie=a)
+    assert "로그인한 브라우저 2개" in html and "지금 이 브라우저" in html
+    other = [s for s in store.list_sessions()][1]["id"]
+    remote.req("POST", f"/sessions/{other}/logout", cookie=a, token=remote.token)
+    assert len(store.list_sessions()) == 1
+    assert remote.req("GET", "/", cookie=b)[0] == 401 or remote.req("GET", "/", cookie=a)[0] == 401
+
+    login()
+    bot.dashboard, bot.dashboard_url = remote, "http://127.0.0.1:8765/"
+    bot.say("대시보드 로그아웃")
+    assert "모두 로그아웃" in bot.app.client.messages["1.0"]["text"] and store.list_sessions() == []
+    assert remote.req("GET", "/", cookie=a)[0] == 401
+
+    bot.say("대시보드", ts="101.0")
+    text = bot.app.client.messages["2.0"]["text"]
+    assert "https://pc.tail1234.ts.net/login?code=" in text and "10분 안에 한 번만" in text
+
+
+def test_expired_sessions_are_refused_and_cleaned(remote, store):
+    code = remote.login_link().split("code=")[1]
+    session = remote.req("POST", "/login", code=code)[2].split(";")[0]
+    store._db.execute("UPDATE sessions SET expires_at='2000-01-01T00:00:00'")
+    store._db.commit()
+    assert remote.req("GET", "/", cookie=session)[0] == 401
+    app.purge_tick(store, datetime(2026, 11, 18, 9, 0))
+    assert store._db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def test_local_browser_still_needs_no_login_when_remote_is_on(remote, store, fake_llm):
+    pipeline.process(store, "메모")
+    status, html = remote.get("/")
+    assert status == 200 and "견적서 재요청" in html                    # 이 PC에서 직접 연 화면

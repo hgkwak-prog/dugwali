@@ -50,6 +50,8 @@ class Config:
 
         self.digest_time = os.getenv("DIGEST_TIME", "17:30")
         self.dashboard_port = int(os.getenv("DASHBOARD_PORT", "8765"))  # 0이면 대시보드를 띄우지 않는다
+        # 다른 기기에서 여는 주소(예: Tailscale serve 주소). 비우면 이 PC 안에서만 열린다
+        self.dashboard_url = os.getenv("DASHBOARD_URL", "").strip().rstrip("/")
 
     @property
     def db_path(self) -> Path:

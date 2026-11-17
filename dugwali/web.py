@@ -1,20 +1,26 @@
 """로컬 대시보드. 봇과 같은 프로세스가 127.0.0.1에만 띄운다. 로그인은 없다.
 
 - 표준 라이브러리만 쓴다(설치할 것이 늘지 않게). 화면은 서버가 그린 HTML이고 스크립트 없이 동작한다.
-- 이 PC 밖에서는 열리지 않는다: 127.0.0.1에만 바인딩하고, Host 헤더가 이 주소가 아니면 거절한다.
+- 127.0.0.1에만 바인딩한다. 이 PC의 브라우저가 직접 연 요청은 로그인 없이 받는다(Host 헤더로 확인).
+- 다른 기기에서는 `DASHBOARD_URL`을 설정했을 때만 열린다. 그 PC까지 닿는 길은 Tailscale serve 같은
+  VPN 프록시가 맡고, 누구인지는 슬랙으로 확인한다: 봇이 소유자의 DM에만 보내는 일회용 링크로 로그인하면
+  그 브라우저에 세션 쿠키를 준다. 프록시를 거친 요청은 세션이 없으면 아무 화면도 보여주지 않는다.
 - 모든 쓰기(POST)는 실행할 때마다 새로 만드는 토큰을 확인한다. 다른 웹사이트가 몰래 요청을 보내지 못한다.
 - 쓰기는 슬랙 버튼과 같은 내부 함수(`pipeline.py`)를 거친다. 고친 내용은 슬랙 초안에도 반영한다.
 - 삭제는 휴지통으로 옮기는 것이고, 화면을 여는 것만으로는 LLM을 부르지 않는다.
 
 슬랙 봇 없이도 뜬다(`python -m dugwali.cli dashboard`). 그때는 슬랙이 필요한 동작만 빠진다.
 """
+import hashlib
 import hmac
 import logging
 import secrets
 import threading
 import re
+import time
 from datetime import date, datetime
 from html import escape as e
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
@@ -31,6 +37,10 @@ QUESTION_DAYS = 14       # 이 기간 안의 기록에서 아직 답하지 않�
 MAX_BODY = 5_000_000     # 붙여 넣는 전사문 크기 상한(바이트)
 STAGE_LABEL = {"extract": "정리", "call": "통화 녹음 처리", "voice": "음성 메모 전사", "digest": "마감 정리 전송"}
 STT_STAGES = ("call", "voice")
+SESSION_DAYS = 30        # 로그인한 브라우저를 기억하는 기간
+LOGIN_CODE_MINUTES = 10  # 슬랙으로 보내는 일회용 접속 링크의 유효 시간
+COOKIE = "dugwali_session"
+PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "Tailscale-User-Login")
 _UNDO = re.compile(r"^(case|record|todo):\d+$")
 
 
@@ -118,6 +128,71 @@ class Dashboard:
         self.port = cfg.dashboard_port if port is None else port
         self.token = secrets.token_urlsafe(24)
         self._server: ThreadingHTTPServer | None = None
+        self._codes: dict[str, float] = {}   # 일회용 접속 코드 → 만료 시각
+        self._codes_lock = threading.Lock()
+        self._ctx = threading.local()        # 요청마다: 로그인한 세션(이 PC에서 직접 열었으면 None)
+
+    # ---------- 다른 기기에서 접속 ----------
+    @staticmethod
+    def _hash(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def login_link(self) -> str | None:
+        """슬랙으로 보낼 일회용 접속 링크. LOGIN_CODE_MINUTES분 안에 한 번만 쓸 수 있다."""
+        if not cfg.dashboard_url:
+            return None
+        code, now = secrets.token_urlsafe(32), time.time()
+        with self._codes_lock:
+            self._codes = {c: t for c, t in self._codes.items() if t > now}
+            self._codes[code] = now + LOGIN_CODE_MINUTES * 60
+        return f"{cfg.dashboard_url}/login?code={code}"
+
+    def _redeem(self, code: str, agent: str) -> str | None:
+        """접속 코드를 쓰고 세션 토큰을 돌려준다. 틀렸거나 이미 썼거나 시간이 지났으면 None."""
+        with self._codes_lock:
+            expires = self._codes.pop(code, 0)
+        if expires < time.time():
+            return None
+        token = secrets.token_urlsafe(32)
+        self.store.add_session(self._hash(token), agent, SESSION_DAYS)
+        return token
+
+    def page_login(self, code: str, failed: bool = False) -> str:
+        if failed or not code:
+            inner = ('<div class="notice">접속 링크가 맞지 않거나 이미 썼거나 시간이 지났습니다.</div>'
+                     "<p>슬랙에서 두괄이에게 <b>대시보드</b>를 보내 새 링크를 받으세요.</p>")
+        else:
+            inner = ('<p>이 브라우저에서 두괄이 대시보드를 엽니다. 한 번 로그인하면 '
+                     f"{SESSION_DAYS}일 동안 다시 묻지 않습니다. 공용 PC에서는 쓰지 마세요.</p>"
+                     f'<form method="post" action="/login"><input type="hidden" name="code" value="{e(code)}">'
+                     '<button class="primary">로그인</button></form>')
+        return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" '
+                f'content="width=device-width,initial-scale=1"><title>로그인 · 두괄이</title><style>{CSS}</style></head>'
+                f'<body><main><h1>두괄이 대시보드</h1><div class="card">{inner}</div></main></body></html>')
+
+    def page_sessions(self, q: dict, msg: str) -> str:
+        mine = getattr(self._ctx, "session", None)
+        rows = self.store.list_sessions()
+        body = ["<h1>접속 관리</h1>"]
+        if not cfg.dashboard_url:
+            body.append('<div class="card">다른 기기에서 여는 기능이 꺼져 있습니다. 지금은 이 PC에서만 열립니다. '
+                        "켜려면 README의 \"다른 기기에서 열기\"를 보세요.</div>")
+        else:
+            body.append(f'<p class="muted">다른 기기에서 여는 주소: {e(cfg.dashboard_url)} · 새 기기는 슬랙에서 '
+                        f"<b>대시보드</b>를 보내 받은 링크로 로그인합니다. 로그인은 {SESSION_DAYS}일 동안 유지됩니다.</p>")
+        if rows:
+            items = "".join(
+                f'<div class="todo"><div>{e(r["agent"] or "알 수 없는 브라우저")}'
+                + ('<span class="badge ok">지금 이 브라우저</span>' if mine and mine["id"] == r["id"] else "")
+                + f'<div class="muted small">로그인 {_when(r["created_at"])} · 마지막 접속 {_when(r["last_seen"])} · '
+                f'{_when(r["expires_at"])[:10]}까지</div></div>'
+                f'{self._form(f"/sessions/{r["id"]}/logout", "로그아웃", "/sessions")}</div>' for r in rows)
+            body.append(f'<h2>로그인한 브라우저 {len(rows)}개</h2><div class="card">{items}</div>'
+                        + self._form("/sessions/logout-all", "모두 로그아웃", "/sessions", cls="danger"))
+        elif cfg.dashboard_url:
+            body.append('<div class="card muted">로그인한 브라우저가 없습니다.</div>')
+        body.append('<p class="muted small">이 PC에서 직접 연 화면은 로그인 없이 열리고 이 목록에 나오지 않습니다.</p>')
+        return self._page("접속 관리", "sessions", "".join(body), msg)
 
     @property
     def url(self) -> str:
@@ -162,6 +237,8 @@ class Dashboard:
         tabs = [("/", "건", "cases"), ("/todos", "할 일", "todos"),
                 ("/attention", "조치 필요" + (f' <span class="badge warn">{n}</span>' if n else ""), "attention"),
                 ("/import", "전사문 가져오기", "import"), ("/profile", "프로필", "profile"), ("/trash", "휴지통", "trash")]
+        if cfg.dashboard_url:
+            tabs.append(("/sessions", "접속 관리", "sessions"))
         nav = "".join(f'<a href="{h}" class="{"on" if k == active else ""}">{label}</a>' for h, label, k in tabs)
         undo = getattr(msg, "undo", "")
         if _UNDO.match(undo):
@@ -524,6 +601,12 @@ class Dashboard:
         back = back if back.startswith("/") and not back.startswith("//") else "/"
         num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
 
+        if parts == ["sessions", "logout-all"]:
+            return "/sessions", f"브라우저 {store.delete_sessions()}개를 모두 로그아웃했습니다."
+        if num is not None and parts[0] == "sessions" and parts[2:] == ["logout"]:
+            store.delete_session(num)
+            return "/sessions", "로그아웃했습니다."
+
         if parts == ["trash", "restore"] and form.get("kind") in ("case", "record", "todo") and form.get("id", "").isdigit():
             where = pipeline.restore(store, form["kind"], int(form["id"]))
             if where.startswith("/cases/"):
@@ -702,11 +785,14 @@ class Dashboard:
             def log_message(self, fmt, *args):  # 접근 기록은 남기지 않는다(주소에 건 번호가 들어간다)
                 pass
 
-            def _send(self, status: int, body: str = "", location: str | None = None) -> None:
+            def _send(self, status: int, body: str = "", location: str | None = None,
+                      cookie: str | None = None) -> None:
                 data = body.encode("utf-8")
                 self.send_response(status)
                 if location:
                     self.send_header("Location", location)
+                if cookie:
+                    self.send_header("Set-Cookie", cookie)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
@@ -715,15 +801,43 @@ class Dashboard:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _local(self) -> bool:
-                """이 PC의 브라우저가 이 주소로 직접 연 요청만 받는다(DNS 리바인딩 차단)."""
-                return self.headers.get("Host", "") in (f"127.0.0.1:{dash.port}", f"localhost:{dash.port}")
+            def _cookie(self, token: str | None) -> str:
+                """세션 쿠키. token이 None이면 지운다."""
+                secure = "; Secure" if cfg.dashboard_url.startswith("https://") else ""
+                age = SESSION_DAYS * 86400 if token else 0
+                return f"{COOKIE}={token or ''}; Path=/; Max-Age={age}; HttpOnly; SameSite=Lax{secure}"
+
+            def _allowed(self) -> bool:
+                """이 요청을 받아도 되는지 정하고, 안 되면 여기서 응답한다.
+
+                - 이 PC의 브라우저가 직접 연 요청(프록시 헤더 없음, Host가 이 PC): 로그인 없이 받는다.
+                - 그 밖(프록시를 거쳤거나 다른 이름으로 온 요청): DASHBOARD_URL이 있고 세션 쿠키가 유효할 때만.
+                """
+                dash._ctx.session = None
+                direct = (self.headers.get("Host", "") in (f"127.0.0.1:{dash.port}", f"localhost:{dash.port}")
+                          and not any(self.headers.get(h) for h in PROXY_HEADERS))
+                if direct:
+                    return True
+                if not cfg.dashboard_url:
+                    self._send(403, "이 PC에서만 열 수 있습니다.")
+                    return False
+                if urlsplit(self.path).path == "/login":
+                    return True
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = jar[COOKIE].value if COOKIE in jar else ""
+                dash._ctx.session = dash.store.get_session(dash._hash(token)) if token else None
+                if dash._ctx.session:
+                    return True
+                self._send(401, dash.page_login(""))
+                return False
 
             def do_GET(self):
-                if not self._local():
-                    return self._send(403, "이 PC에서만 열 수 있습니다.")
+                if not self._allowed():
+                    return
                 url = urlsplit(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
+                if url.path == "/login":
+                    return self._send(200, dash.page_login(q.get("code", "")))
                 msg, parts = Flash(q.get("msg", "")), [x for x in url.path.split("/") if x]
                 msg.undo = q.get("undo", "")
                 num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
@@ -738,7 +852,7 @@ class Dashboard:
                         page = dash.page_delete(parts[0][:-1], num, msg)
                     elif num is not None and parts[0] == "todos" and parts[2:] == ["edit"]:
                         page = dash.page_todo_edit(num, q, msg)
-                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile", "trash"):
+                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile", "trash", "sessions"):
                         page = getattr(dash, f"page_{parts[0]}")(q, msg)
                     else:
                         page = None
@@ -752,13 +866,18 @@ class Dashboard:
                 self._send(200, page)
 
             def do_POST(self):
-                if not self._local():
-                    return self._send(403, "이 PC에서만 열 수 있습니다.")
+                if not self._allowed():
+                    return
                 length = int(self.headers.get("Content-Length") or 0)
                 if length > MAX_BODY:
                     return self._send(413, "내용이 너무 큽니다.")
                 form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8", "replace"),
                                                      keep_blank_values=True).items()}
+                if urlsplit(self.path).path == "/login":  # 아직 세션이 없다: 일회용 코드가 곧 자격이다
+                    token = dash._redeem(form.get("code", ""), self.headers.get("User-Agent", ""))
+                    if not token:
+                        return self._send(401, dash.page_login("", failed=True))
+                    return self._send(303, location="/", cookie=self._cookie(token))
                 if not hmac.compare_digest(form.get("token", ""), dash.token):
                     return self._send(403, dash._page("거절", "", '<div class="notice">이 화면이 오래됐습니다(두괄이가 '
                                                       '다시 켜졌을 수 있습니다). <a href="/">새로 열어</a> 다시 해 주세요.</div>'))
