@@ -5,8 +5,10 @@ faster-whisper로 단어 단위 타임스탬프까지 받아쓰고, pyannote로 
 
 필요한 것
   pip install faster-whisper "av<19" pyannote.audio torch
-  Hugging Face 토큰 (pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0 약관 동의)
-  토큰은 --hf-token 또는 환경변수 HF_TOKEN 으로 넘긴다.
+  Hugging Face 토큰과 모델 약관 동의
+    pyannote 4.x: pyannote/speaker-diarization-community-1
+    pyannote 3.x: pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0
+  토큰은 환경변수 HF_TOKEN 으로 넘기는 것을 권한다 (--hf-token 도 가능).
 
 사용 예
   python transcribe_speakers.py 녹음.m4a                 # 화자 수 자동
@@ -21,6 +23,8 @@ import time
 from pathlib import Path
 
 SAMPLE_RATE = 16000
+# 윈도우(개발자 모드 꺼짐)에서 매번 뜨는 symlink 경고를 끈다. 캐시는 그대로 동작한다.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
 def transcribe_words(audio, model_name: str, compute: str, language: str | None) -> list[dict]:
@@ -41,9 +45,15 @@ def transcribe_words(audio, model_name: str, compute: str, language: str | None)
     return words
 
 
-def diarize(audio, token: str, model_name: str, speakers: int | None,
-            min_speakers: int | None, max_speakers: int | None) -> list[tuple[float, float, str]]:
-    import torch
+def default_diar_model() -> str:
+    """pyannote 4.x는 community-1, 3.x는 3.1. (4.x에서 3.1을 부르면 community-1 파일도 받아야 한다)"""
+    from importlib.metadata import version
+
+    major = int(version("pyannote.audio").split(".")[0])
+    return "pyannote/speaker-diarization-community-1" if major >= 4 else "pyannote/speaker-diarization-3.1"
+
+
+def load_diarizer(token: str, model_name: str):
     from pyannote.audio import Pipeline
 
     try:
@@ -52,6 +62,12 @@ def diarize(audio, token: str, model_name: str, speakers: int | None,
         pipeline = Pipeline.from_pretrained(model_name, use_auth_token=token)
     if pipeline is None:
         raise RuntimeError(f"{model_name} 을(를) 불러오지 못했습니다. 토큰과 약관 동의를 확인하세요.")
+    return pipeline
+
+
+def diarize(pipeline, audio, speakers: int | None,
+            min_speakers: int | None, max_speakers: int | None) -> list[tuple[float, float, str]]:
+    import torch
 
     kwargs = {}
     if speakers:
@@ -131,18 +147,31 @@ def main() -> int:
     p.add_argument("--compute", default=os.getenv("WHISPER_COMPUTE", "int8"))
     p.add_argument("--language", default="ko", help="언어 코드. auto면 자동 감지")
     p.add_argument("--hf-token", default=os.getenv("HF_TOKEN"))
-    p.add_argument("--diar-model", default="pyannote/speaker-diarization-3.1")
+    p.add_argument("--diar-model", help="기본: pyannote 4.x면 community-1, 3.x면 3.1")
     args = p.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")  # 윈도우 콘솔 한글 깨짐 방지
     if not args.no_diarize and not args.hf_token:
-        p.error("화자 분리에는 Hugging Face 토큰이 필요합니다 (--hf-token 또는 HF_TOKEN). "
+        p.error("화자 분리에는 Hugging Face 토큰이 필요합니다 (HF_TOKEN 환경변수 또는 --hf-token). "
                 "전사만 하려면 --no-diarize")
+
+    started = time.time()
+    pipeline = None
+    if not args.no_diarize:
+        # 긴 전사를 마친 뒤에 실패하지 않도록 화자 분리 모델부터 받아 둔다.
+        diar_model = args.diar_model or default_diar_model()
+        print(f"화자 분리 모델 준비 ({diar_model})", file=sys.stderr)
+        try:
+            pipeline = load_diarizer(args.hf_token, diar_model)
+        except Exception as e:
+            print(f"\n화자 분리 모델을 불러오지 못했습니다: {e}\n"
+                  f"https://hf.co/{diar_model} 에서 약관에 동의했는지 확인하세요. "
+                  "전사만 하려면 --no-diarize", file=sys.stderr)
+            return 1
 
     from faster_whisper import decode_audio
 
-    started = time.time()
     audio = decode_audio(args.audio, sampling_rate=SAMPLE_RATE)
     duration = len(audio) / SAMPLE_RATE
     print(f"길이 {fmt_time(duration)} — 전사 시작 ({args.model})", file=sys.stderr)
@@ -151,11 +180,13 @@ def main() -> int:
     words = transcribe_words(audio, args.model, args.compute, language)
     t_stt = time.time() - started
 
-    if not args.no_diarize and words:
+    if pipeline is not None and words:
         print("화자 분리 중...", file=sys.stderr)
-        turns = diarize(audio, args.hf_token, args.diar_model,
-                        args.speakers, args.min_speakers, args.max_speakers)
-        words = assign_speakers(words, turns)
+        try:
+            turns = diarize(pipeline, audio, args.speakers, args.min_speakers, args.max_speakers)
+            words = assign_speakers(words, turns)
+        except Exception as e:  # 전사 결과는 살린다
+            print(f"화자 분리 실패, 화자 표기 없이 저장합니다: {e}", file=sys.stderr)
 
     text = format_lines(words)
     out = Path(args.out) if args.out else Path(args.audio).with_suffix(".txt")
