@@ -8,23 +8,20 @@
 - **LLM**: 구독 계정으로 로그인한 Claude Code를 헤드리스(`claude -p`)로 호출. 기록 1건당 1회
 - **음성**: 랩탑에서 로컬 전사. 음성 파일은 밖으로 나가지 않음
 
-## 1. 설치 (윈도우)
+## 1. 설치와 실행 (윈도우)
 
-```bash
-python -m venv .venv
-```
+`run.bat`을 더블클릭하면 됩니다. 가상환경을 켤 필요가 없습니다.
 
-```bash
-.venv\Scripts\activate
-```
+- 처음 실행하면 가상환경을 만들고 패키지를 설치합니다(몇 분 걸림).
+- `.env`가 없으면 예시에서 만들어 메모장으로 엽니다. 2번의 슬랙 토큰을 채우고 다시 실행하세요.
+- 오류로 멈추면 10초 뒤 자동으로 다시 켭니다. 끄려면 창을 닫으세요.
+- 로그는 창과 `data\dugwali.log`에 함께 남습니다.
 
-```bash
-pip install -r requirements.txt
-```
+**윈도우 로그인 시 자동 시작**: `autostart-on.bat`을 한 번 실행하면 다음 로그인부터 최소화된 창으로 켜집니다. 해제는 `autostart-off.bat`입니다. 두괄이가 꺼져 있는 동안의 통화는 처리되지 않으니 켜 두는 것을 권합니다.
 
-```bash
-copy config.example.env .env
-```
+### 직접 실행 (명령줄)
+
+`run.bat`이 만든 가상환경의 파이썬을 직접 부르면 활성화 없이 CLI를 쓸 수 있습니다. 아래 `python`은 모두 `.venv\Scripts\python.exe`로 바꿔 써도 됩니다.
 
 Claude Code를 설치하고 구독 계정으로 한 번 로그인해 둔 뒤 점검합니다.
 
@@ -73,11 +70,7 @@ settings:
   socket_mode_enabled: true
 ```
 
-실행:
-
-```bash
-python -m dugwali.app
-```
+실행: `run.bat` 더블클릭 (또는 `python -m dugwali.app`)
 
 슬랙에서 두괄이 앱 → 메시지 탭에 아무렇게나 적어 보내면 됩니다. `도움말`, `건`, `할일`, `오늘` 명령이 있습니다.
 

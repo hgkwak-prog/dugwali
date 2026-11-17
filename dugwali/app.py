@@ -1,8 +1,10 @@
 """진입점: 슬랙 봇 + 통화 녹음 감시 + 일일 다이제스트.  실행: python -m dugwali.app"""
 import logging
+import sys
 import threading
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from . import digest, pipeline
@@ -47,11 +49,17 @@ def digest_loop(bot, store: Store) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg.ensure_dirs()
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(),  # 창이 최소화돼 있어도 나중에 볼 수 있게 파일에도 남긴다
+                  RotatingFileHandler(cfg.data_dir / "dugwali.log", maxBytes=1_000_000, backupCount=3,
+                                      encoding="utf-8")])
     missing = [k for k, v in (("SLACK_BOT_TOKEN", cfg.slack_bot_token), ("SLACK_APP_TOKEN", cfg.slack_app_token),
                               ("OWNER_SLACK_USER_ID", cfg.owner_user_id)) if not v]
     if missing:
-        raise SystemExit(f".env에 다음 값이 필요합니다: {', '.join(missing)}")
+        log.error(".env에 다음 값이 필요합니다: %s", ", ".join(missing))
+        sys.exit(2)  # 설정 오류: run.bat이 재시작하지 않고 멈춘다
 
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
