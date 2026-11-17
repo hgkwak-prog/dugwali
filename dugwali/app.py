@@ -12,6 +12,7 @@ from . import digest, pipeline
 from .config import cfg
 from .ingest.watcher import CallWatcher
 from .store import Store
+from .web import Dashboard
 
 log = logging.getLogger("dugwali")
 
@@ -147,6 +148,8 @@ def main() -> None:
     else:
         log.info("CALL_DIR 미설정: 통화 녹음 감시를 끕니다")
     threading.Thread(target=digest_loop, args=(bot, store), daemon=True, name="digest").start()
+    if cfg.dashboard_port:
+        bot.dashboard_url = Dashboard(store, bot).start()
 
     log.info("두괄이 시작 (LLM: %s, 전사: %s, 통화 전사문 자동 전송: %s). 슬랙에서 봇에게 DM을 보내 보세요.",
              cfg.llm_provider, cfg.stt_provider, "켜짐" if cfg.send_calls_to_llm else "꺼짐")

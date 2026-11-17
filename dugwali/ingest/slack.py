@@ -19,6 +19,7 @@ from ..config import cfg
 from ..labels import SOURCE_LABEL
 from ..store import Store
 from ..stt.transcribe import local_available
+from . import transcript
 from .watcher import AUDIO_EXT
 
 log = logging.getLogger(__name__)
@@ -28,10 +29,10 @@ HELP = (
     "• 여기에 아무렇게나 적어 보내면 두괄식·개조식으로 정리해 스레드에 답합니다.\n"
     "• 정리된 스레드에 답글을 달면 그 내용을 반영해 다시 정리합니다.\n"
     "• 같은 일에 대한 기록은 초안의 *합치기* 버튼으로 한 건으로 묶습니다. 일이 끝난 뒤의 후속 메모도 같은 방법으로 붙입니다.\n"
-    "• 음성 메모 파일을 올리면 받아써서 정리합니다.\n"
+    "• 음성 메모 파일을 올리면 받아써서 정리합니다. 다른 도구로 전사한 파일(.txt/.vtt/.srt)도 받습니다.\n"
     "• `건` 진행 중인 건 목록(통합 정리·종결·삭제) · `할일` 미완료 목록 · `오늘` 오늘 정리\n"
     "• `조치` 처리에 실패했거나 아직 정리 안 된 기록, 놓친 통화 녹음\n"
-    "• `프로필` 내 정리 기준(profile.md)이 어떻게 읽혔는지 · `도움말`"
+    "• `프로필` 내 정리 기준(profile.md)이 어떻게 읽혔는지 · `대시보드` 건·할 일을 보는 화면 주소 · `도움말`"
 )
 MAX_CASES_LISTED = 15
 MAX_ATTENTION_LISTED = 10
@@ -232,6 +233,7 @@ class Bot:
         # 통화 녹음 감시를 켰을 때 app.py가 채운다
         self.watcher = None        # CallWatcher
         self.process_call = None   # (Path, notify, provider) -> 남은 실패 항목 또는 None
+        self.dashboard_url = None  # 대시보드를 띄웠을 때 app.py가 채운다
         self.app = App(token=cfg.slack_bot_token)
         self._dm_channel: str | None = None
         self._register()
@@ -276,6 +278,37 @@ class Bot:
 
     def _missed(self) -> list[Path] | None:
         return self.watcher.missed() if self.watcher else None
+
+    def _import(self, client, channel: str, ts: str, note: str, f: dict) -> None:
+        """슬랙에 올린 전사문 파일(.txt/.vtt/.srt)을 통화 기록으로 받는다."""
+        store = self.store
+        holder = client.chat_postMessage(channel=channel, thread_ts=ts, text="전사문 받는 중…")
+        rec = None
+        try:
+            body = transcript.read(self._download(f))
+            if not body:
+                raise RuntimeError("전사문에서 내용을 찾지 못했습니다.")
+            rec = pipeline.hold(store, "\n".join(x for x in (note, f"파일명: {f.get('name')}", body) if x), "import")
+            store.set_slack_ref(rec["id"], channel, ts, holder["ts"])
+            if cfg.send_calls_to_llm:
+                self._redraw(client, pipeline.summarize(store, rec["id"]))
+            else:
+                info = "📄 전사문을 받았습니다. 이 PC에만 저장했습니다."
+                client.chat_update(channel=channel, ts=holder["ts"], text=info,
+                                   blocks=held_call_blocks(store.get_record(rec["id"]), info))
+        except pipeline.ProcessError as e:
+            client.chat_update(channel=channel, ts=holder["ts"], text="정리 실패", blocks=failure_blocks(e.failure))
+        except Exception as e:
+            log.exception("전사문 가져오기 실패")
+            client.chat_update(channel=channel, ts=holder["ts"], text=f"전사문 가져오기 실패: {e}")
+
+    def retry_failure(self, f: dict, provider: str | None = None) -> dict | None:
+        """슬랙 밖(대시보드)에서 실패를 다시 시도할 때 쓴다."""
+        return self._retry(self.app.client, f, provider)
+
+    def show_record(self, rec: dict) -> None:
+        """슬랙 밖(대시보드)에서 정리한 기록을 슬랙에도 반영한다."""
+        self._show(self.app.client, rec)
 
     def _voice(self, client, rid: int, provider: str | None = None) -> dict | None:
         """음성 메모 기록을 받아써서 정리한다. 막히면 실패 항목을 남기고 돌려준다(성공하면 None).
@@ -401,6 +434,11 @@ class Bot:
                 client.chat_postMessage(channel=channel, text="조치 필요",
                                         blocks=attention_blocks(store, self._missed()))
                 return
+            if text in ("대시보드", "dashboard"):
+                client.chat_postMessage(channel=channel, text=(
+                    f"대시보드: {self.dashboard_url}\n두괄이가 켜져 있는 그 PC의 브라우저에서만 열립니다."
+                    if self.dashboard_url else "대시보드가 꺼져 있습니다(.env의 DASHBOARD_PORT 확인)."))
+                return
             if text in ("프로필", "profile"):
                 p = profile.load()
                 hint = "" if p.exists else ("\n프로필 파일이 없어 기본값으로 정리합니다. 만들려면 PC에서 "
@@ -415,6 +453,11 @@ class Bot:
             audio = [f for f in event.get("files") or []
                      if Path(f.get("name") or "").suffix.lower() in AUDIO_EXT
                      or str(f.get("mimetype", "")).startswith("audio/")]
+            docs = [f for f in event.get("files") or []
+                    if Path(f.get("name") or "").suffix.lower() in transcript.TRANSCRIPT_EXT]
+            if docs and not audio:  # 다른 도구에서 전사한 결과: 통화 녹음과 같은 게이트를 거친다
+                self._import(client, channel, ts, text, docs[0])
+                return
             if not text and not audio:
                 return
             holder = client.chat_postMessage(channel=channel, thread_ts=ts,
@@ -586,16 +629,8 @@ class Bot:
         def on_dismiss_failure(ack, body, client):
             ack()
             in_list, f = _failure_action(body)
-            note = ""
-            if f:
-                store.resolve_failures(fid=f["id"])
-                rec = store.get_record(f["record_id"]) if f.get("record_id") else None
-                if rec and not rec["data"]:
-                    if rec["raw_text"].strip():
-                        note = " 원문은 `조치` 목록의 정리 안 된 기록에 남아 있습니다."
-                    else:  # 받아쓰지 못한 음성 메모: 남길 내용이 없다
-                        pipeline.delete(store, rec["id"])
-                        note = " 받아쓴 내용이 없어 기록은 지웠습니다. 음성 파일은 그대로 있습니다."
+            note = pipeline.dismiss_failure(store, f["id"]) if f else ""
+            note = f" {note} (`조치`에서 볼 수 있습니다)" if "남아" in note else f" {note}" if note else ""
             if in_list:
                 _relist(client, body)
             else:

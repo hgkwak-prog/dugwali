@@ -11,6 +11,7 @@
   python -m dugwali.cli retry 5                  # 5번 기록을 다시 정리
   python -m dugwali.cli profile                  # 프로필이 어떻게 읽혔는지 확인
   python -m dugwali.cli profile --init sales-pm  # 예시 프로필로 시작
+  python -m dugwali.cli dashboard                # 슬랙 없이 대시보드만 띄우기
   python -m dugwali.cli check                    # claude 헤드리스 호출 점검
 """
 import argparse
@@ -43,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     pr = sub.add_parser("profile", help="개인 프로필 확인·만들기")
     pr.add_argument("--init", nargs="?", const="default", metavar="예시",
                     help=f"예시 프로필을 복사해 시작 ({', '.join(profile.examples()) or '예시 없음'})")
+    sub.add_parser("dashboard", help="슬랙 없이 대시보드만 띄우기")
     sub.add_parser("attention", help="처리 실패와 정리 안 된 기록")
     r_ = sub.add_parser("retry", help="정리에 실패했거나 보관만 한 기록을 다시 정리")
     r_.add_argument("record_id", type=int)
@@ -87,6 +89,20 @@ def main(argv: list[str] | None = None) -> int:
         print(profile.describe())
         if not profile.load().exists:
             print(f"\n시작하려면: python -m dugwali.cli profile --init [{' | '.join(profile.examples())}]")
+    elif args.cmd == "dashboard":
+        import time
+
+        from .web import Dashboard
+
+        url = Dashboard(Store(cfg.db_path), port=cfg.dashboard_port or 8765).start()
+        if not url:
+            return 1
+        print(f"대시보드: {url}\n이 PC의 브라우저에서 여세요. 끄려면 Ctrl+C.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
     elif args.cmd == "attention":
         failures, pending = digest.attention(Store(cfg.db_path))
         for f in failures:

@@ -12,6 +12,8 @@ from dugwali.ingest.watcher import CallWatcher
 import sqlite3
 
 from dugwali.ingest import slack as slack_ui
+from dugwali.ingest import transcript
+from dugwali.web import Dashboard
 from dugwali.store import Store
 from dugwali.stt.transcribe import assign_speakers, format_transcript
 
@@ -862,3 +864,169 @@ def test_slack_profile_command_shows_how_it_was_read(bot, no_personal_profile):
     bot.say("프로필", ts="101.0")
     text = bot.app.client.messages["2.0"]["text"]
     assert "슬랙 순서: 결론 → 할 일 → 결정" in text and "⚠️" in text
+
+
+# ---------- 전사문 가져오기 ----------
+
+VTT = """WEBVTT
+
+NOTE 회의 녹음
+이 줄은 메모라서 빠진다
+
+1
+00:00:01.000 --> 00:00:03.000
+<v 김과장>안녕하세요</v>
+
+2
+00:00:03.000 --> 00:00:05.000
+<v 김과장>견적 건으로 <b>연락</b>드렸습니다
+
+3
+00:00:05.000 --> 00:00:06.000
+<v 나>네 말씀하세요
+"""
+SRT = "1\n00:00:01,000 --> 00:00:03,000\n화자1: 금요일까지 부탁드립니다\n\n2\n00:00:03,000 --> 00:00:04,000\n화자1: 꼭이요\n"
+
+
+def test_transcript_clean_strips_cue_numbers_and_times():
+    assert transcript.clean(VTT) == "김과장: 안녕하세요 견적 건으로 연락드렸습니다\n나: 네 말씀하세요"
+    assert transcript.clean(SRT) == "화자1: 금요일까지 부탁드립니다 꼭이요"
+    assert transcript.clean("  그냥 메모\n둘째 줄 12  ") == "그냥 메모\n둘째 줄 12"
+
+
+def test_import_follows_the_same_gate_as_calls(store, fake_llm, monkeypatch):
+    rec = pipeline.import_transcript(store, "화자1: 안녕하세요", "A사 통화", "후속 건")
+    assert rec["data"] is None and fake_llm == [] and rec["source"] == "import"
+    assert rec["raw_text"] == "후속 건\n파일명: A사 통화\n화자1: 안녕하세요"
+    monkeypatch.setattr(cfg, "send_calls_to_llm", True)
+    assert pipeline.import_transcript(store, "화자1: 네")["data"]["title"] == "견적서 재요청"
+
+
+def test_slack_transcript_file_is_held_until_approved(bot, store, fake_llm, monkeypatch, tmp_path):
+    path = tmp_path / "meeting.vtt"
+    path.write_text(VTT, encoding="utf-8")
+    monkeypatch.setattr(bot, "_download", lambda f: path)
+    bot.app.handlers["message"]({"channel_type": "im", "user": "U1", "channel": "D1", "ts": "100.0", "text": "",
+                                 "files": [{"id": "F1", "name": "meeting.vtt"}]}, bot.app.client)
+    rec = store.get_record(1)
+    assert fake_llm == [] and rec["source"] == "import" and "김과장: 안녕하세요" in rec["raw_text"]
+    assert "00:00" not in rec["raw_text"] and set(bot.app.client.actions("1.0")) == {"summarize_call", "delete_record"}
+
+
+# ---------- 대시보드 ----------
+
+@pytest.fixture
+def dash(store):
+    import http.client
+    import urllib.parse
+
+    d = Dashboard(store, port=0)
+    d.start()
+
+    def get(path, host=None):
+        c = http.client.HTTPConnection("127.0.0.1", d.port, timeout=5)
+        c.request("GET", path, headers={"Host": host} if host else {})
+        r = c.getresponse()
+        return r.status, r.read().decode("utf-8")
+
+    def post(path, token=True, follow=True, **form):
+        if token:
+            form["token"] = d.token if token is True else token
+        c = http.client.HTTPConnection("127.0.0.1", d.port, timeout=5)
+        c.request("POST", path, urllib.parse.urlencode(form), {"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        body, loc = r.read().decode("utf-8"), r.getheader("Location")
+        if follow and r.status == 303:
+            return get(loc)
+        return r.status, loc or body
+
+    d.get, d.post = get, post
+    yield d
+    d.stop()
+
+
+def test_dashboard_shows_cases_todos_and_attention(dash, store, fake_llm):
+    a = pipeline.process(store, "원문 <script>alert(1)</script> 메모")
+    pipeline.hold(store, "비밀 전사문", "call", "/calls/call_1402.m4a")
+    status, html = dash.get("/")
+    assert status == 200 and "진행 중인 건 2개" in html and "#1 견적서 재요청" in html
+    assert "A사가 수정 견적서를 금요일까지 요청함" in html and '<span class="badge warn">1</span>' in html
+    _, html = dash.get(f"/cases/{a['case_id']}")
+    assert "단가는 기존 유지" in html and "견적서는 누구 검토를 받아야 하나요?" in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html and "<script>alert" not in html   # 원문은 그대로 실행되지 않게
+    _, html = dash.get("/todos")
+    assert "미완료 할 일 2건" in html and "A사 김과장: </span>납기 가능일 회신" in html
+    _, html = dash.get("/attention")
+    assert "정리 안 된 기록 1건" in html and "call_1402.m4a" in html and "비밀 전사문" not in html
+    assert "아직 답하지 않은 질문 1개" in html and "확인 안 함(감시 꺼짐)" in html
+    assert dash.get("/profile")[0] == 200 and dash.get("/import")[0] == 200
+    assert dash.get("/cases/999")[0] == 404 and dash.get("/nope")[0] == 404
+
+
+def test_dashboard_only_answers_local_requests_with_the_run_token(dash, store, fake_llm):
+    pipeline.process(store, "메모")
+    assert dash.get("/", host="evil.example.com")[0] == 403            # 다른 이름으로 들어온 요청(DNS 리바인딩)
+    assert dash.get("/", host=f"localhost:{dash.port}")[0] == 200
+    tid = store.open_todos()[0]["id"]
+    assert dash.post(f"/todos/{tid}/done", token=False)[0] == 403       # 토큰 없는 쓰기(다른 사이트의 몰래 요청)
+    assert dash.post(f"/todos/{tid}/done", token="wrong")[0] == 403
+    assert len(store.open_todos()) == 2
+    status, loc = dash.post(f"/todos/{tid}/done", follow=False, next="//evil.example.com/x")
+    assert status == 303 and loc.startswith("/?msg=") and len(store.open_todos()) == 1   # 밖으로 돌려보내지 않는다
+
+
+def test_dashboard_todo_done_and_undo(dash, store, fake_llm):
+    a = pipeline.process(store, "메모")
+    tid = next(t["id"] for t in store.open_todos() if t["owner"] == "나")
+    _, html = dash.post(f"/todos/{tid}/done", next="/todos")
+    assert "완료 처리했습니다." in html and "미완료 할 일 1건" in html
+    _, html = dash.get(f"/cases/{a['case_id']}")
+    assert '<div class="done">수정 견적서 작성</div>' in html and f"/todos/{tid}/reopen" in html
+    dash.post(f"/todos/{tid}/reopen", next=f"/cases/{a['case_id']}")
+    assert len(store.open_todos()) == 2
+
+
+def test_dashboard_attention_actions_without_slack(dash, store, broken_llm):
+    with pytest.raises(pipeline.ProcessError):
+        pipeline.process(store, "메모")
+    held = pipeline.hold(store, "전사문", "call")
+    store.record_failure("call", "/calls/a.m4a", "전사 실패")
+    fid = store.open_failures()[0]["id"]
+    _, html = dash.post(f"/failures/{fid}/retry", next="/attention")
+    assert "다시 실패했습니다" in html and store.get_failure(fid)["attempts"] == 2
+    _, html = dash.post(f"/failures/{store.open_failures()[1]['id']}/retry", next="/attention")
+    assert "슬랙 봇과 함께 실행 중일 때만" in html
+    broken_llm["broken"] = False
+    _, html = dash.post(f"/failures/{fid}/retry", next="/attention")
+    assert "다시 처리했습니다." in html and [f["stage"] for f in store.open_failures()] == ["call"]
+    _, html = dash.post(f"/records/{held['id']}/summarize", next="/attention")
+    assert "정리했습니다." in html and store.get_record(held["id"])["data"]
+    _, html = dash.post(f"/failures/{store.open_failures()[0]['id']}/dismiss", next="/attention")
+    assert "넘겼습니다." in html and "막힌 건이 없습니다." in html
+
+
+def test_dashboard_import_and_combined_summary(dash, store, fake_llm, monkeypatch):
+    _, html = dash.post("/import", text="   ")
+    assert "전사문이 비어 있습니다." in html
+    _, html = dash.post("/import", text=SRT, name="A사 통화")
+    assert "이 PC에 저장했습니다" in html and "아직 정리하지 않은 기록입니다" in html and fake_llm == []
+    assert store.get_record(1)["raw_text"] == "파일명: A사 통화\n화자1: 금요일까지 부탁드립니다 꼭이요"
+    monkeypatch.setattr(cfg, "send_calls_to_llm", True)
+    _, html = dash.post("/import", text="화자1: 네")
+    assert "가져와 정리했습니다." in html and len(fake_llm) == 1
+
+    a, b = pipeline.process(store, "하나"), pipeline.process(store, "둘")
+    store.move_record(b["id"], a["case_id"])                    # 통합 정리를 아직 만들지 않은 상태
+    n = len(fake_llm)
+    _, html = dash.get(f"/cases/{a['case_id']}")
+    assert "통합 정리를 다시 만들지 않았습니다" in html and len(fake_llm) == n   # 화면을 여는 것만으로는 LLM을 부르지 않는다
+    _, html = dash.post(f"/cases/{a['case_id']}/summary", next=f"/cases/{a['case_id']}")
+    assert "통합 정리를 만들었습니다." in html and len(fake_llm) == n + 1
+
+
+def test_slack_dashboard_command(bot):
+    bot.say("대시보드")
+    assert "꺼져 있습니다" in bot.app.client.messages["1.0"]["text"]
+    bot.dashboard_url = "http://127.0.0.1:8765/"
+    bot.say("대시보드", ts="101.0")
+    assert "http://127.0.0.1:8765/" in bot.app.client.messages["2.0"]["text"]

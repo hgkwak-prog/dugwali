@@ -109,6 +109,31 @@ def hold(store: Store, raw_text: str, source: str, audio_path: str | None = None
     return store.get_record(store.add_record(source, raw_text, None, audio_path))
 
 
+def import_transcript(store: Store, text: str, name: str | None = None, note: str = "") -> dict:
+    """다른 도구에서 전사한 결과를 기록으로 받는다. 통화 녹음과 같은 게이트를 거친다.
+
+    원문을 먼저 보관하고, SEND_CALLS_TO_LLM이 켜져 있을 때만 바로 정리한다(실패하면 ProcessError).
+    """
+    head = "\n".join(x for x in (note.strip(), f"파일명: {name}" if name else "") if x)
+    rec = hold(store, f"{head}\n{text}".strip(), "import")
+    return summarize(store, rec["id"]) if cfg.send_calls_to_llm else rec
+
+
+def dismiss_failure(store: Store, fid: int) -> str:
+    """실패 항목을 닫는다. 그 기록이 어떻게 됐는지 한 줄로 돌려준다."""
+    f = store.get_failure(fid)
+    if not f:
+        return ""
+    store.resolve_failures(fid=fid)
+    rec = store.get_record(f["record_id"]) if f.get("record_id") else None
+    if rec and not rec["data"]:
+        if rec["raw_text"].strip():
+            return "원문은 정리 안 된 기록에 남아 있습니다."
+        delete(store, rec["id"])  # 받아쓰지 못한 음성 메모: 남길 내용이 없다
+        return "받아쓴 내용이 없어 기록은 지웠습니다. 음성 파일은 그대로 있습니다."
+    return ""
+
+
 def summarize(store: Store, rid: int) -> dict:
     """원문만 있는 기록을 구조화한다(통화 요약 승인, 정리 실패 뒤 다시 시도)."""
     rec = store.get_record(rid)

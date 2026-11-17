@@ -112,15 +112,18 @@ class Store:
 
     def open_cases(self, days: int | None = None) -> list[dict]:
         """진행 중인 건(최근 갱신순). 기록 수와 미완료 할 일 수를 함께 준다."""
+        return self.list_cases("open", days)
+
+    def list_cases(self, status: str = "open", days: int | None = None) -> list[dict]:
         sql = """SELECT c.*,
                    (SELECT COUNT(*) FROM records r WHERE r.case_id=c.id) AS n_records,
                    (SELECT COUNT(*) FROM todos t JOIN records r ON r.id=t.record_id
                      WHERE r.case_id=c.id AND t.done=0) AS n_todos
-                 FROM cases c WHERE c.status='open'"""
-        args: tuple = ()
+                 FROM cases c WHERE c.status=?"""
+        args: tuple = (status,)
         if days is not None:
             sql += " AND c.updated_at >= ?"
-            args = ((datetime.now() - timedelta(days=days)).isoformat(timespec="seconds"),)
+            args += ((datetime.now() - timedelta(days=days)).isoformat(timespec="seconds"),)
         with self._lock:
             return [_row(r) for r in self._db.execute(sql + " ORDER BY c.updated_at DESC, c.id DESC", args)]
 
@@ -312,6 +315,24 @@ class Store:
                 " WHERE t.done=0 ORDER BY (t.due IS NULL), t.due, t.id"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def case_todos(self, cid: int) -> list[dict]:
+        """건의 할 일 전부(완료 포함). 미완료가 먼저, 그 안에서는 기한순."""
+        with self._lock:
+            return [dict(r) for r in self._db.execute(
+                "SELECT t.*, r.case_id FROM todos t JOIN records r ON r.id=t.record_id"
+                " WHERE r.case_id=? ORDER BY t.done, (t.due IS NULL), t.due, t.id", (cid,))]
+
+    def reopen_todo(self, tid: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("UPDATE todos SET done=0 WHERE id=?", (tid,))
+
+    def records_since(self, days: int) -> list[dict]:
+        since = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM records WHERE created_at >= ? ORDER BY created_at DESC, id DESC", (since,)).fetchall()
+        return [_row(r) for r in rows]
 
     def complete_todo(self, tid: int) -> dict | None:
         with self._lock, self._db:

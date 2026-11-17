@@ -49,6 +49,7 @@ class Config:
         self.hf_token = os.getenv("HF_TOKEN", "").strip()
 
         self.digest_time = os.getenv("DIGEST_TIME", "17:30")
+        self.dashboard_port = int(os.getenv("DASHBOARD_PORT", "8765"))  # 0이면 대시보드를 띄우지 않는다
 
     @property
     def db_path(self) -> Path:
