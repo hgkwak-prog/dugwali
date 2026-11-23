@@ -247,7 +247,8 @@ class Bot:
         return self._dm_channel
 
     def post_dm(self, text: str, blocks: list[dict] | None = None) -> dict:
-        return self.app.client.chat_postMessage(channel=self.dm_channel(), text=text, blocks=blocks)
+        return self.app.client.chat_postMessage(channel=self.dm_channel(), text=text, blocks=blocks,
+                                                unfurl_links=False, unfurl_media=False)
 
     def post_record(self, rec: dict, prefix: str = "") -> None:
         """봇이 시작하는 기록(통화)을 DM 최상위 메시지로 올린다."""
@@ -451,17 +452,14 @@ class Bot:
                 client.chat_postMessage(channel=channel, text=f"대시보드에 로그인한 브라우저 {n}개를 모두 로그아웃했습니다.")
                 return
             if text in ("대시보드", "dashboard"):
-                link = self.dashboard.login_link() if self.dashboard and self.dashboard_url else None
+                login = self.dashboard.login_message() if self.dashboard and self.dashboard_url else None
                 if not self.dashboard_url:
                     reply = "대시보드가 꺼져 있습니다(.env의 DASHBOARD_PORT 확인)."
-                elif link:  # 이 DM은 소유자만 받으므로 링크가 곧 본인 확인이다
-                    reply = (f"*다른 기기에서 열기* (10분 안에 한 번만 쓸 수 있는 링크)\n{link}\n"
-                             f"*두괄이가 켜져 있는 PC에서 열기*\n{self.dashboard_url}\n"
-                             "로그인한 브라우저는 대시보드의 `접속 관리`에서 보고 끊을 수 있습니다. "
-                             "한꺼번에 끊으려면 `대시보드 로그아웃`을 보내세요.")
+                elif login:  # 이 DM은 소유자만 받으므로 링크가 곧 본인 확인이다
+                    reply = f"{login}\n두괄이가 켜져 있는 PC에서는 로그인 없이 {self.dashboard_url} 로 엽니다."
                 else:
                     reply = f"대시보드: {self.dashboard_url}\n두괄이가 켜져 있는 그 PC의 브라우저에서만 열립니다."
-                client.chat_postMessage(channel=channel, text=reply)
+                client.chat_postMessage(channel=channel, text=reply, unfurl_links=False, unfurl_media=False)
                 return
             if text in ("프로필", "profile"):
                 p = profile.load()

@@ -5,7 +5,8 @@
 - 다른 기기에서는 `DASHBOARD_URL`을 설정했을 때만 열린다. 그 PC까지 닿는 길은 Tailscale serve 같은
   VPN 프록시가 맡고, 누구인지는 슬랙으로 확인한다: 봇이 소유자의 DM에만 보내는 일회용 링크로 로그인하면
   그 브라우저에 세션 쿠키를 준다. 프록시를 거친 요청은 세션이 없으면 아무 화면도 보여주지 않는다.
-- 모든 쓰기(POST)는 실행할 때마다 새로 만드는 토큰을 확인한다. 다른 웹사이트가 몰래 요청을 보내지 못한다.
+- 모든 쓰기(POST)는 화면 토큰을 확인한다. 다른 웹사이트가 몰래 요청을 보내지 못한다. 토큰은 DB에 두어
+  두괄이를 다시 켜도 열려 있던 화면이 그대로 동작한다.
 - 쓰기는 슬랙 버튼과 같은 내부 함수(`pipeline.py`)를 거친다. 고친 내용은 슬랙 초안에도 반영한다.
 - 삭제는 휴지통으로 옮기는 것이고, 화면을 여는 것만으로는 LLM을 부르지 않는다.
 
@@ -39,9 +40,19 @@ STAGE_LABEL = {"extract": "정리", "call": "통화 녹음 처리", "voice": "�
 STT_STAGES = ("call", "voice")
 SESSION_DAYS = 30        # 로그인한 브라우저를 기억하는 기간
 LOGIN_CODE_MINUTES = 10  # 슬랙으로 보내는 일회용 접속 링크의 유효 시간
+LOGIN_REQUEST_GAP = 30   # 로그인 화면에서 링크를 다시 보내 달라고 할 수 있는 최소 간격(초)
+LOGIN_REQUEST_MAX = 5    # 그 화면에서 LOGIN_CODE_MINUTES분 동안 보낼 수 있는 링크 수
 COOKIE = "dugwali_session"
 PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "Tailscale-User-Login")
 _UNDO = re.compile(r"^(case|record|todo):\d+$")
+
+
+def _safe_next(path: str) -> str:
+    """로그인 뒤 돌아갈 곳. 이 대시보드 안의 경로만 허용한다(다른 사이트로 보내는 링크를 막는다)."""
+    path = (path or "").strip()
+    if not path.startswith("/") or path.startswith("//") or "\\" in path or path.startswith("/login"):
+        return "/"
+    return path
 
 
 class Flash(str):
@@ -126,9 +137,11 @@ class Dashboard:
     def __init__(self, store: Store, bot=None, port: int | None = None) -> None:
         self.store, self.bot = store, bot
         self.port = cfg.dashboard_port if port is None else port
-        self.token = secrets.token_urlsafe(24)
+        self.token = store.get_state("dashboard_token") or secrets.token_urlsafe(24)
+        store.set_state("dashboard_token", self.token)
         self._server: ThreadingHTTPServer | None = None
         self._codes: dict[str, float] = {}   # 일회용 접속 코드 → 만료 시각
+        self._requests: list[float] = []     # 로그인 화면에서 링크를 보낸 시각
         self._codes_lock = threading.Lock()
         self._ctx = threading.local()        # 요청마다: 로그인한 세션(이 PC에서 직접 열었으면 None)
 
@@ -137,15 +150,46 @@ class Dashboard:
     def _hash(token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def login_link(self) -> str | None:
-        """슬랙으로 보낼 일회용 접속 링크. LOGIN_CODE_MINUTES분 안에 한 번만 쓸 수 있다."""
+    def login_link(self, next_path: str = "/") -> str | None:
+        """슬랙으로 보낼 일회용 접속 링크. LOGIN_CODE_MINUTES분 안에 한 번만 쓸 수 있다.
+
+        next_path가 있으면 로그인한 뒤 그 화면으로 간다(슬랙 알림의 건 링크를 열었다가 로그인한 경우)."""
         if not cfg.dashboard_url:
             return None
         code, now = secrets.token_urlsafe(32), time.time()
         with self._codes_lock:
             self._codes = {c: t for c, t in self._codes.items() if t > now}
             self._codes[code] = now + LOGIN_CODE_MINUTES * 60
-        return f"{cfg.dashboard_url}/login?code={code}"
+        nxt = _safe_next(next_path)
+        return f"{cfg.dashboard_url}/login?code={code}" + (f"&next={quote(nxt)}" if nxt != "/" else "")
+
+    def login_message(self, next_path: str = "/") -> str | None:
+        """슬랙 DM으로 보내는 로그인 안내. 슬랙 `대시보드` 명령과 로그인 화면의 버튼이 함께 쓴다."""
+        link = self.login_link(next_path)
+        if not link:
+            return None
+        return (f"*<{link}|이 링크를 눌러 대시보드에 로그인>* ({LOGIN_CODE_MINUTES}분 안에 한 번만 쓸 수 있습니다)\n"
+                "Tailscale이 켜진 기기에서 여세요. 슬랙 앱 안에서 열렸다면 `브라우저에서 열기`로 연 뒤 로그인해야 "
+                f"로그인이 {SESSION_DAYS}일 동안 유지됩니다.\n"
+                "로그인한 브라우저는 대시보드의 `접속 관리`에서 보고 끊을 수 있고, 한꺼번에 끊으려면 "
+                "`대시보드 로그아웃`을 보내세요.")
+
+    def request_login(self, next_path: str) -> str:
+        """로그인 화면의 '슬랙으로 링크 받기'. 링크는 소유자 DM으로만 간다. 결과 상태를 돌려준다."""
+        if not (self.bot and hasattr(self.bot, "post_dm")):
+            return "noslack"
+        now = time.time()
+        with self._codes_lock:
+            self._requests = [t for t in self._requests if t > now - LOGIN_CODE_MINUTES * 60]
+            if (self._requests and self._requests[-1] > now - LOGIN_REQUEST_GAP) or len(self._requests) >= LOGIN_REQUEST_MAX:
+                return "busy"
+            self._requests.append(now)
+        try:
+            self.bot.post_dm(self.login_message(next_path))
+        except Exception:
+            log.exception("슬랙으로 로그인 링크를 보내지 못했습니다")
+            return "error"
+        return "sent"
 
     def _redeem(self, code: str, agent: str) -> str | None:
         """접속 코드를 쓰고 세션 토큰을 돌려준다. 틀렸거나 이미 썼거나 시간이 지났으면 None."""
@@ -157,15 +201,44 @@ class Dashboard:
         self.store.add_session(self._hash(token), agent, SESSION_DAYS)
         return token
 
-    def page_login(self, code: str, failed: bool = False) -> str:
-        if failed or not code:
-            inner = ('<div class="notice">접속 링크가 맞지 않거나 이미 썼거나 시간이 지났습니다.</div>'
-                     "<p>슬랙에서 두괄이에게 <b>대시보드</b>를 보내 새 링크를 받으세요.</p>")
-        else:
-            inner = ('<p>이 브라우저에서 두괄이 대시보드를 엽니다. 한 번 로그인하면 '
+    def page_login(self, state: str, code: str = "", next_path: str = "/") -> str:
+        """다른 기기의 로그인 화면.
+
+        state: new(로그인 안 한 브라우저), code(슬랙 링크로 옴), failed(링크를 이미 썼거나 시간 지남),
+        sent(슬랙으로 링크를 보냄), busy(방금 보냄), noslack(슬랙 없이 띄움), error(보내기 실패)."""
+        nxt = e(_safe_next(next_path))
+        ask = ('<form method="post" action="/login/request">'
+               f'<input type="hidden" name="next" value="{nxt}">'
+               '<button class="primary">슬랙으로 로그인 링크 받기</button></form>')
+        ask_again = ask.replace('class="primary"', "")
+        if state == "code":
+            inner = ("<p>이 브라우저에서 두괄이 대시보드를 엽니다. 한 번 로그인하면 "
                      f"{SESSION_DAYS}일 동안 다시 묻지 않습니다. 공용 PC에서는 쓰지 마세요.</p>"
                      f'<form method="post" action="/login"><input type="hidden" name="code" value="{e(code)}">'
-                     '<button class="primary">로그인</button></form>')
+                     f'<input type="hidden" name="next" value="{nxt}">'
+                     '<button class="primary">로그인</button></form>'
+                     '<p class="muted small">슬랙 앱 안에서 열렸다면 메뉴의 <b>브라우저에서 열기</b>로 연 뒤 누르세요. '
+                     "앱 안 브라우저는 로그인을 기억하지 못할 수 있습니다.</p>")
+        elif state == "failed":
+            inner = ('<div class="notice">이 링크는 이미 썼거나 '
+                     f"{LOGIN_CODE_MINUTES}분이 지났습니다.</div><p>새 링크를 받아 다시 로그인하세요.</p>{ask}")
+        elif state == "sent":
+            inner = ("<p><b>슬랙 DM을 확인하세요.</b> 두괄이가 로그인 링크를 보냈습니다. "
+                     f"{LOGIN_CODE_MINUTES}분 안에 이 기기에서 여세요.</p>"
+                     f'<p class="muted small">안 왔으면 {LOGIN_REQUEST_GAP}초 뒤에 다시 받을 수 있습니다.</p>{ask_again}')
+        elif state == "busy":
+            inner = ('<div class="notice">방금 링크를 보냈습니다. 슬랙 DM을 먼저 확인하고, '
+                     "안 왔으면 조금 뒤에 다시 받으세요.</div>" + ask_again)
+        elif state == "noslack":
+            inner = ('<div class="notice">슬랙 봇이 연결되지 않아 링크를 보낼 수 없습니다.</div>'
+                     "<p>두괄이를 슬랙과 함께 켠 뒤(<code>run.bat</code>) 다시 시도하세요.</p>")
+        elif state == "error":
+            inner = ('<div class="notice">슬랙으로 링크를 보내지 못했습니다. 두괄이 PC의 로그'
+                     "(data/dugwali.log)를 확인하세요.</div>" + ask_again)
+        else:
+            inner = ("<p>이 브라우저는 아직 로그인하지 않았습니다. 버튼을 누르면 두괄이가 <b>내 슬랙 DM</b>으로 "
+                     f"로그인 링크를 보냅니다.</p>{ask}"
+                     '<p class="muted small">슬랙에서 두괄이에게 <b>대시보드</b>를 보내도 같은 링크를 받습니다.</p>')
         return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" '
                 f'content="width=device-width,initial-scale=1"><title>로그인 · 두괄이</title><style>{CSS}</style></head>'
                 f'<body><main><h1>두괄이 대시보드</h1><div class="card">{inner}</div></main></body></html>')
@@ -821,14 +894,12 @@ class Dashboard:
                 if not cfg.dashboard_url:
                     self._send(403, "이 PC에서만 열 수 있습니다.")
                     return False
-                if urlsplit(self.path).path == "/login":
-                    return True
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
                 token = jar[COOKIE].value if COOKIE in jar else ""
                 dash._ctx.session = dash.store.get_session(dash._hash(token)) if token else None
-                if dash._ctx.session:
+                if dash._ctx.session or urlsplit(self.path).path.startswith("/login"):
                     return True
-                self._send(401, dash.page_login(""))
+                self._send(401, dash.page_login("new", next_path=self.path if self.command == "GET" else "/"))
                 return False
 
             def do_GET(self):
@@ -837,7 +908,10 @@ class Dashboard:
                 url = urlsplit(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
                 if url.path == "/login":
-                    return self._send(200, dash.page_login(q.get("code", "")))
+                    nxt = _safe_next(q.get("next", "/"))
+                    if dash._ctx.session:   # 이미 로그인한 브라우저: 링크를 쓰지 않고 바로 연다
+                        return self._send(303, location=nxt)
+                    return self._send(200, dash.page_login("code" if q.get("code") else "new", q.get("code", ""), nxt))
                 msg, parts = Flash(q.get("msg", "")), [x for x in url.path.split("/") if x]
                 msg.undo = q.get("undo", "")
                 num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
@@ -873,11 +947,16 @@ class Dashboard:
                     return self._send(413, "내용이 너무 큽니다.")
                 form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8", "replace"),
                                                      keep_blank_values=True).items()}
-                if urlsplit(self.path).path == "/login":  # 아직 세션이 없다: 일회용 코드가 곧 자격이다
+                path, nxt = urlsplit(self.path).path, _safe_next(form.get("next", "/"))
+                if path == "/login/request" and not dash._ctx.session:
+                    if not cfg.dashboard_url:
+                        return self._send(404, "")
+                    return self._send(200, dash.page_login(dash.request_login(nxt), next_path=nxt))
+                if path == "/login":  # 아직 세션이 없다: 일회용 코드가 곧 자격이다
                     token = dash._redeem(form.get("code", ""), self.headers.get("User-Agent", ""))
                     if not token:
-                        return self._send(401, dash.page_login("", failed=True))
-                    return self._send(303, location="/", cookie=self._cookie(token))
+                        return self._send(401, dash.page_login("failed", next_path=nxt))
+                    return self._send(303, location=nxt, cookie=self._cookie(token))
                 if not hmac.compare_digest(form.get("token", ""), dash.token):
                     return self._send(403, dash._page("거절", "", '<div class="notice">이 화면이 오래됐습니다(두괄이가 '
                                                       '다시 켜졌을 수 있습니다). <a href="/">새로 열어</a> 다시 해 주세요.</div>'))

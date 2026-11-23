@@ -490,7 +490,7 @@ class FakeClient:
     def __init__(self):
         self.n, self.messages = 0, {}   # ts → {"text", "blocks"}
 
-    def chat_postMessage(self, channel, text=None, blocks=None, thread_ts=None):
+    def chat_postMessage(self, channel, text=None, blocks=None, thread_ts=None, **_):
         self.n += 1
         ts = f"{self.n}.0"
         self.messages[ts] = {"text": text, "blocks": blocks or []}
@@ -1384,3 +1384,65 @@ def test_local_browser_still_needs_no_login_when_remote_is_on(remote, store, fak
     pipeline.process(store, "메모")
     status, html = remote.get("/")
     assert status == 200 and "견적서 재요청" in html                    # 이 PC에서 직접 연 화면
+
+
+def test_login_page_sends_link_to_slack_and_returns_to_the_page(remote, store, monkeypatch, fake_llm):
+    import dugwali.web as web
+
+    pipeline.process(store, "메모")
+    status, html, _, _ = remote.req("GET", "/cases/1")
+    assert status == 401 and "아직 로그인하지 않았습니다" in html and "이미 썼거나" not in html   # 처음 온 브라우저에 '틀렸다'고 하지 않는다
+    assert 'name="next" value="/cases/1"' in html
+
+    status, html, _, _ = remote.req("POST", "/login/request", next="/cases/1")
+    assert status == 200 and "슬랙 봇이 연결되지 않아" in html                # 슬랙 없이 띄운 대시보드
+
+    sent = []
+    remote.bot = type("B", (), {"post_dm": lambda self, text: sent.append(text)})()
+    status, html, _, _ = remote.req("POST", "/login/request", next="/cases/1")
+    assert status == 200 and "슬랙 DM을 확인하세요" in html and len(sent) == 1
+    assert remote.req("POST", "/login/request", next="/")[1].count("방금 링크를 보냈습니다") == 1 and len(sent) == 1
+    link = sent[0].split("<")[1].split("|")[0]
+    assert link.startswith("https://pc.tail1234.ts.net/login?code=") and link.endswith("&next=/cases/1")
+
+    path = link.removeprefix("https://pc.tail1234.ts.net")
+    status, html, _, _ = remote.req("GET", path)
+    assert 'name="next" value="/cases/1"' in html and "브라우저에서 열기" in html
+    code = path.split("code=")[1].split("&")[0]
+    status, _, cookie, loc = remote.req("POST", "/login", code=code, next="/cases/1")
+    assert status == 303 and loc == "/cases/1"                                  # 로그인 뒤 보려던 화면으로
+    session = cookie.split(";")[0]
+    status, html, _, _ = remote.req("POST", "/login", code=code)
+    assert status == 401 and "이미 썼거나" in html and "슬랙으로 로그인 링크 받기" in html
+
+    other = remote.login_link().split("code=")[1]
+    status, _, _, loc = remote.req("GET", f"/login?code={other}&next=/todos", cookie=session)
+    assert status == 303 and loc == "/todos"                                    # 이미 로그인한 브라우저는 링크를 쓰지 않는다
+    assert remote.req("POST", "/login", code=other)[0] == 303
+
+    now = time.time()
+    monkeypatch.setattr(web.time, "time", lambda: now + web.LOGIN_REQUEST_GAP + 1)
+    remote.req("POST", "/login/request")
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize("bad", ["https://evil.example", "//evil.example", "/\\evil.example", "javascript:x", "/login?x"])
+def test_login_next_cannot_leave_the_dashboard(remote, bad):
+    code = remote.login_link().split("code=")[1]
+    assert remote.req("POST", "/login", code=code, next=bad)[3] == "/"
+
+
+def test_login_requests_from_the_page_are_capped(remote, monkeypatch):
+    import dugwali.web as web
+
+    sent, now = [], time.time()
+    remote.bot = type("B", (), {"post_dm": lambda self, text: sent.append(text)})()
+    for i in range(web.LOGIN_REQUEST_MAX + 2):
+        monkeypatch.setattr(web.time, "time", lambda i=i: now + i * (web.LOGIN_REQUEST_GAP + 1))
+        remote.req("POST", "/login/request")
+    assert len(sent) == web.LOGIN_REQUEST_MAX
+
+
+def test_screen_token_survives_restart(store):
+    a = Dashboard(store, port=0)
+    assert Dashboard(store, port=0).token == a.token
