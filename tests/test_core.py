@@ -1,7 +1,7 @@
 """LLM·슬랙·오디오 없이 도는 테스트. 실행: pytest"""
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -129,7 +129,17 @@ def test_hold_does_not_call_llm_until_summarize(store, fake_llm):
     assert len(fake_llm) == 1
 
 
-def test_digest_flags_overdue_and_splits_owners(store, fake_llm):
+def _later(days: int = 30) -> str:
+    """실행하는 날과 무관하게 아직 급하지 않은 기한."""
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
+def _not_urgent(data: dict) -> dict:
+    return {**data, "todos": [{**t, "due": _later() if t["due"] else None} for t in data["todos"]]}
+
+
+def test_digest_flags_overdue_and_splits_owners(store, llm_out):
+    llm_out["data"] = _not_urgent(SAMPLE)
     pipeline.process(store, "메모")
     text = digest.build(store, date.today())
     assert "오늘 다룬 건 1개 (기록 1건)" in text
@@ -1068,8 +1078,9 @@ def test_manual_todo_edit_survives_reextraction(store, llm_out):
 
 
 def test_todo_dropped_by_llm_becomes_suspect_not_deleted(store, llm_out):
+    llm_out["data"] = _not_urgent(SAMPLE)
     rec = pipeline.process(store, "메모")
-    added = pipeline.add_todo(store, rec["case_id"], "계약서 초안 검토", None, "2026-11-30")
+    added = pipeline.add_todo(store, rec["case_id"], "계약서 초안 검토", None, _later(40))
     llm_out["data"] = {**SAMPLE, "todos": [{"task": "납기  가능일 회신.", "owner": "A사 김과장", "due": None}]}
     pipeline.amend(store, rec["id"], "견적서는 이미 보냄")
     todos = {t["task"]: t for t in store.open_todos()}
