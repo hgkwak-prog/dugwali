@@ -12,6 +12,7 @@ from datetime import date
 
 from . import views
 from .agent import extract as ex
+from .agent import llm
 from .agent.llm import LLMError, LLMLimitError
 from .config import cfg
 from .labels import SOURCE_LABEL
@@ -383,3 +384,56 @@ def case_summary(store: Store, cid: int) -> dict | None:
     store.set_case_summary(cid, data)
     _refresh(store, {r["created_at"][:10] for r in recs}, {cid})
     return data
+
+
+# ---------- 고친 것에서 규칙 후보 ----------
+RULE_THRESHOLD = 3       # 같은 항목을 이만큼 고치면 규칙으로 올릴지 묻는다
+RULE_EXAMPLES = 5        # 규칙 초안을 만들 때 LLM에 보여주는 수정 사례 수
+RULE_FIELDS = {**{f: views.FIELD_LABEL[f] for f in ("title", "conclusion", "decisions", "open_questions", "background")},
+               "task": "할 일 문구"}
+
+RULE_PROMPT = """사용자가 업무 기록 정리 결과의 '{label}' 항목을 직접 고친 사례들이다.
+고친 방향에서 앞으로도 지킬 정리 규칙을 한국어 한 문장으로 뽑아라.
+
+- 사례들에 공통으로 보이는 방향만 규칙으로 만든다. 특정 회사·사람·숫자는 넣지 않는다.
+- 이미 있는 규칙과 겹치면 겹치지 않게 다듬는다.
+- 공통된 방향이 없으면 rule을 빈 문자열로 둔다.
+- 개조식 명사형으로 끝낸다(예: "결론 첫머리에 기한을 넣기").
+
+이미 있는 규칙:
+{existing}
+
+사례(고치기 전 → 고친 뒤):
+{examples}
+
+JSON으로만 답한다: {{"rule": "...", "reason": "사례에서 본 공통점 한 줄"}}"""
+
+
+def rule_candidates(store: Store) -> list[dict]:
+    """같은 항목을 RULE_THRESHOLD번 이상 고쳤으면 후보로 돌려준다: [{"field", "label", "items"}]."""
+    groups = store.open_corrections(set(RULE_FIELDS))
+    return [{"field": f, "label": RULE_FIELDS[f], "items": items}
+            for f, items in sorted(groups.items(), key=lambda kv: -len(kv[1])) if len(items) >= RULE_THRESHOLD]
+
+
+def _short(v: str | None) -> str:
+    try:
+        v = json.loads(v) if v and v.startswith("[") else v
+    except ValueError:
+        pass
+    return " / ".join(v) if isinstance(v, list) else (v or "(비어 있음)")
+
+
+def suggest_rule(store: Store, field: str) -> dict:
+    """고친 사례를 LLM에 보여주고 규칙 초안 한 문장을 받는다(LLM 1회). {"rule", "reason"}."""
+    from . import profile
+
+    cand = next((c for c in rule_candidates(store) if c["field"] == field), None)
+    if not cand:
+        raise ValueError("그 항목은 아직 규칙 후보가 아닙니다.")
+    examples = "\n".join(f"- {_short(c['before'])} → {_short(c['after'])}" for c in cand["items"][:RULE_EXAMPLES])
+    existing = profile.section_body(profile.cfg.profile_path.read_text(encoding="utf-8"), profile.RULES_HEADING) \
+        if profile.cfg.profile_path.exists() else ""
+    out = llm.call_json(llm.mask(RULE_PROMPT.format(label=cand["label"], existing=existing or "(없음)",
+                                                    examples=examples)))
+    return {"rule": str(out.get("rule") or "").strip(), "reason": str(out.get("reason") or "").strip()}

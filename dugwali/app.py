@@ -4,6 +4,7 @@ import logging
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -127,6 +128,47 @@ def digest_loop(bot, store: Store) -> None:
         time.sleep(30)
 
 
+AUTH_ERRORS = ("invalid_auth", "not_authed", "token_revoked", "account_inactive", "not_allowed_token_type")
+
+
+def connect_slack(store: Store, dash: Dashboard | None, url: str | None, opener=None):
+    """슬랙 봇을 띄운다. 토큰이 없거나 틀리면 대시보드의 첫 설정 화면을 열고, 거기서 확인을 통과할 때까지 기다린다.
+
+    토큰 문제가 아닌 실패(네트워크 등)는 그대로 올려 보내 run.bat이 잠시 뒤 다시 켜게 한다.
+    """
+    from .ingest.slack import Bot
+
+    opened = False
+    while True:
+        missing = cfg.slack_missing()
+        if missing:
+            problem = f".env에 슬랙 설정이 비어 있습니다({', '.join(missing)})."
+        else:
+            try:
+                bot = Bot(store)
+            except Exception as err:
+                if not any(code in str(err) for code in AUTH_ERRORS):
+                    raise
+                problem = f"슬랙 토큰이 맞지 않습니다({err})."
+            else:
+                if dash:
+                    dash.setup_mode = False
+                return bot
+        if not url:
+            log.error("%s 대시보드가 꺼져 있어(DASHBOARD_PORT=0) 첫 설정 화면을 열 수 없습니다. .env를 직접 고치세요.", problem)
+            sys.exit(2)  # 설정 오류: run.bat이 재시작하지 않고 멈춘다
+        log.warning("%s 브라우저에서 %ssetup 을 열어 슬랙을 연결하세요.", problem, url)
+        dash.setup_mode, dash.slack_result = True, [f"❌ {problem}"] if not missing else []
+        dash.slack_ready.clear()
+        if not opened:
+            opened = True
+            try:
+                (opener or webbrowser.open)(url + "setup")
+            except Exception:
+                log.exception("브라우저를 열지 못했습니다")
+        dash.slack_ready.wait()
+
+
 def main() -> None:
     cfg.ensure_dirs()
     logging.basicConfig(
@@ -134,19 +176,14 @@ def main() -> None:
         handlers=[logging.StreamHandler(),  # 창이 최소화돼 있어도 나중에 볼 수 있게 파일에도 남긴다
                   RotatingFileHandler(cfg.data_dir / "dugwali.log", maxBytes=1_000_000, backupCount=3,
                                       encoding="utf-8")])
-    missing = [k for k, v in (("SLACK_BOT_TOKEN", cfg.slack_bot_token), ("SLACK_APP_TOKEN", cfg.slack_app_token),
-                              ("OWNER_SLACK_USER_ID", cfg.owner_user_id)) if not v]
-    if missing:
-        log.error(".env에 다음 값이 필요합니다: %s", ", ".join(missing))
-        sys.exit(2)  # 설정 오류: run.bat이 재시작하지 않고 멈춘다
-
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-    from .ingest.slack import Bot
-
-    cfg.ensure_dirs()
     store = Store(cfg.db_path)
-    bot = Bot(store)
+    dash = Dashboard(store) if cfg.dashboard_port else None
+    url = dash.start() if dash else None
+    bot = connect_slack(store, dash, url)
+    if dash:
+        dash.bot, bot.dashboard, bot.dashboard_url = bot, dash, url
 
     if cfg.call_dir:
         # 처음 켠 시점을 기억해 두고, 그 뒤에 생겼는데 놓친 녹음은 켤 때마다 처리할지 묻는다
@@ -162,9 +199,6 @@ def main() -> None:
     else:
         log.info("CALL_DIR 미설정: 통화 녹음 감시를 끕니다")
     threading.Thread(target=digest_loop, args=(bot, store), daemon=True, name="digest").start()
-    if cfg.dashboard_port:
-        bot.dashboard = Dashboard(store, bot)
-        bot.dashboard_url = bot.dashboard.start()
 
     log.info("두괄이 시작 (LLM: %s, 전사: %s, 통화 전사문 자동 전송: %s). 슬랙에서 봇에게 DM을 보내 보세요.",
              cfg.llm_provider, cfg.stt_provider, "켜짐" if cfg.send_calls_to_llm else "꺼짐")

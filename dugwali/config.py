@@ -4,15 +4,23 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent.parent
+ENV_PATH = Path(os.getenv("DUGWALI_ENV") or ROOT / ".env")
+load_dotenv(ENV_PATH)
 
 
 def _flag(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _placeholder(v: str) -> bool:
+    """예시 파일에 있던 자리표시자(xoxb-..., U0XXXXXXX)는 아직 안 채운 것으로 본다."""
+    return not v or "..." in v or "XXXX" in v
+
+
 class Config:
     def __init__(self) -> None:
+        self.env_path = ENV_PATH
         self.slack_bot_token = os.getenv("SLACK_BOT_TOKEN", "")
         self.slack_app_token = os.getenv("SLACK_APP_TOKEN", "")
         self.owner_user_id = os.getenv("OWNER_SLACK_USER_ID", "")
@@ -52,6 +60,11 @@ class Config:
         self.dashboard_port = int(os.getenv("DASHBOARD_PORT", "8765"))  # 0이면 대시보드를 띄우지 않는다
         # 다른 기기에서 여는 주소(예: Tailscale serve 주소). 비우면 이 PC 안에서만 열린다
         self.dashboard_url = os.getenv("DASHBOARD_URL", "").strip().rstrip("/")
+
+    def slack_missing(self) -> list[str]:
+        """슬랙 연결에 필요한데 비어 있는 설정 이름."""
+        return [k for k, v in (("SLACK_BOT_TOKEN", self.slack_bot_token), ("SLACK_APP_TOKEN", self.slack_app_token),
+                               ("OWNER_SLACK_USER_ID", self.owner_user_id)) if _placeholder(v)]
 
     @property
     def db_path(self) -> Path:

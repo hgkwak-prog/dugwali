@@ -14,7 +14,10 @@
 """
 import hashlib
 import hmac
+import importlib.util
+import json
 import logging
+import os
 import secrets
 import threading
 import re
@@ -26,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import digest, pipeline, profile, views
+from . import digest, envfile, onboard, pipeline, profile, views
 from .config import cfg
 from .ingest import transcript
 from .labels import SOURCE_LABEL
@@ -97,6 +100,10 @@ select{font:inherit;padding:5px 8px;border-radius:7px;border:1px solid var(--lin
 .fields{display:flex;gap:8px;flex-wrap:wrap}.fields input{flex:1;min-width:120px}
 button.danger{color:var(--danger)}a.btn{display:inline-block;padding:5px 12px;border-radius:7px;border:1px solid var(--line);color:var(--text)}
 a.btn.danger{color:var(--danger)}
+label.opt{display:block;margin:4px 0}label.opt input{margin-right:6px}
+.step{display:flex;gap:10px;align-items:baseline}.step .n{font-weight:700;color:var(--muted)}
+input[type=password],input[type=time],input[type=number]{font:inherit;padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--text)}
+input[type=password]{width:100%}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;margin:8px 0}
 details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:8px}
 .todo{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:8px 0;border-top:1px solid var(--line)}
@@ -142,6 +149,10 @@ class Dashboard:
         self._server: ThreadingHTTPServer | None = None
         self._codes: dict[str, float] = {}   # 일회용 접속 코드 → 만료 시각
         self._requests: list[float] = []     # 로그인 화면에서 링크를 보낸 시각
+        self.setup_mode = False              # 슬랙 토큰이 없거나 틀려 봇 없이 띄웠다(app.py가 켠다)
+        self.slack_ready = threading.Event() # 첫 설정에서 슬랙 확인을 통과하면 app.py가 봇을 띄운다
+        self.slack_result: list[str] = []    # 마지막 슬랙 확인 결과
+        self.restart_needed: list[str] = []  # 저장했지만 다시 켜야 반영되는 설정
         self._codes_lock = threading.Lock()
         self._ctx = threading.local()        # 요청마다: 로그인한 세션(이 PC에서 직접 열었으면 None)
 
@@ -309,9 +320,13 @@ class Dashboard:
         n = len(failures) + len(pending) + len(self._missed() or [])
         tabs = [("/", "건", "cases"), ("/todos", "할 일", "todos"),
                 ("/attention", "조치 필요" + (f' <span class="badge warn">{n}</span>' if n else ""), "attention"),
-                ("/import", "전사문 가져오기", "import"), ("/profile", "프로필", "profile"), ("/trash", "휴지통", "trash")]
+                ("/import", "전사문 가져오기", "import")]
+        rules = len(pipeline.rule_candidates(self.store))
+        tabs.append(("/profile", "프로필" + (f' <span class="badge warn">{rules}</span>' if rules else ""), "profile"))
+        tabs.append(("/trash", "휴지통", "trash"))
         if cfg.dashboard_url:
             tabs.append(("/sessions", "접속 관리", "sessions"))
+        tabs.append(("/settings", "설정", "settings"))
         nav = "".join(f'<a href="{h}" class="{"on" if k == active else ""}">{label}</a>' for h, label, k in tabs)
         undo = getattr(msg, "undo", "")
         if _UNDO.match(undo):
@@ -320,6 +335,9 @@ class Dashboard:
         else:
             undo = ""
         flash = f'<div class="flash"><span>{e(msg)}</span>{undo}</div>' if msg else ""
+        if self.restart_needed and active != "settings":
+            flash += (f'<div class="notice">저장한 설정({e(", ".join(self.restart_needed))})은 두괄이를 다시 켜야 '
+                      '반영됩니다. <a href="/settings">설정</a></div>')
         return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8">'
                 f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)} · 두괄이</title>'
                 f"<style>{CSS}</style></head><body><header><nav><span class=\"brand\">두괄이</span>{nav}</nav></header>"
@@ -330,7 +348,8 @@ class Dashboard:
         status = "closed" if q.get("status") == "closed" else "open"
         cases = self.store.list_cases(status)
         switch = ('<a href="/?status=closed">종결한 건 보기</a>' if status == "open" else '<a href="/">진행 중인 건 보기</a>')
-        body = [f'<div class="row"><h1>{"진행 중인 건" if status == "open" else "종결한 건"} {len(cases)}개</h1>'
+        body = [self._setup_banner(),
+                f'<div class="row"><h1>{"진행 중인 건" if status == "open" else "종결한 건"} {len(cases)}개</h1>'
                 f'<div class="small">{switch}</div></div>']
         if not cases:
             body.append('<div class="card muted">건이 없습니다. 슬랙에서 두괄이에게 메모를 보내면 여기에 쌓입니다.</div>')
@@ -628,15 +647,191 @@ class Dashboard:
                 '<p class="muted small">파일로 가지고 있다면 슬랙 DM에 .txt / .vtt / .srt 파일을 올려도 됩니다.</p>')
         return self._page("전사문 가져오기", "import", body, msg)
 
+    # ---------- 첫 설정 · 설정 · 프로필 ----------
+    @property
+    def _remote(self) -> bool:
+        """다른 기기에서 로그인해 연 화면인지. 설정과 슬랙 토큰은 이 PC에서만 바꾼다."""
+        return getattr(self._ctx, "session", None) is not None
+
+    def _setup_left(self) -> list[str]:
+        left = []
+        if self.setup_mode:
+            left.append("슬랙 연결")
+        if not profile.load().exists:
+            left.append("프로필 만들기")
+        return left
+
+    def _setup_banner(self) -> str:
+        left = self._setup_left()
+        if not left:
+            return ""
+        return (f'<div class="notice"><b>처음 설정이 남았습니다:</b> {e(", ".join(left))} · '
+                '<a href="/setup">첫 설정 열기</a></div>')
+
+    def page_setup(self, q: dict, msg: str) -> str:
+        body = ["<h1>첫 설정</h1><p class=\"muted\">슬랙 연결 → LLM 확인 → 프로필 순서로 하면 됩니다. "
+                "다 하면 슬랙 DM에 메모를 보내 첫 초안을 받아 보세요.</p>"]
+        if self._remote:
+            body.append('<div class="notice">첫 설정은 두괄이가 켜진 PC에서만 할 수 있습니다.</div>')
+            return self._page("첫 설정", "settings", "".join(body), msg)
+        slack_ok = not self.setup_mode and not cfg.slack_missing()
+        result = "".join(f"<li>{e(x)}</li>" for x in self.slack_result)
+        result = f"<ul>{result}</ul>" if result else ""
+        if self.slack_ready.is_set() and self.setup_mode:
+            state = '<span class="badge">연결하는 중… 잠시 뒤 새로 고치세요</span>'
+        else:
+            state = '<span class="badge ok">연결됨</span>' if slack_ok else '<span class="badge warn">필요</span>'
+        body.append(f'<div class="card"><div class="step"><span class="n">1</span><h3>슬랙 연결 {state}</h3></div>')
+        if not slack_ok or q.get("redo"):
+            body.append(
+                "<ol><li><a href=\"https://api.slack.com/apps\" target=\"_blank\" rel=\"noopener\">api.slack.com/apps</a>"
+                " → <b>Create New App</b> → <b>From a manifest</b> → 워크스페이스 고르기 → 아래 내용을 붙여 넣고 만들기</li>"
+                "<li><b>Basic Information</b> → <b>App-Level Tokens</b> → <b>Generate</b>, 범위 <code>connections:write</code>"
+                " → 나온 <b>xapp-</b> 토큰을 아래 앱 토큰 칸에</li>"
+                "<li><b>Install App</b> → 워크스페이스에 설치 → <b>Bot User OAuth Token</b>(xoxb-)을 봇 토큰 칸에</li>"
+                "<li>슬랙에서 내 프로필 → <b>⋮ 더보기</b> → <b>멤버 ID 복사</b>(U로 시작)를 멤버 ID 칸에</li></ol>"
+                f"<details><summary>매니페스트 (붙여 넣을 내용)</summary><pre>{e(onboard.MANIFEST)}</pre></details>"
+                f'<form method="post" action="/setup/slack">{self._hidden("/setup")}'
+                '<div class="label">봇 토큰 (xoxb-)</div><input type="password" name="bot" autocomplete="off" required>'
+                '<div class="label">앱 토큰 (xapp-)</div><input type="password" name="app" autocomplete="off" required>'
+                '<div class="label">내 멤버 ID (U…)</div><input type="text" name="owner" autocomplete="off" required>'
+                '<p><button class="primary">확인하고 저장</button></p></form>'
+                '<p class="muted small">확인을 통과한 값만 이 PC의 .env에 저장합니다. 통과하면 내 슬랙 DM으로 확인 메시지가 갑니다.</p>')
+        else:
+            body.append('<p>슬랙 DM으로 메모를 받을 수 있습니다. <a href="/setup?redo=1">다시 설정</a></p>')
+        body.append(f"{result}</div>")
+        how = "Claude Code(구독 계정)" if cfg.llm_provider == "claude_code" else "Claude API 키"
+        hint = ("Claude Code를 설치하고 구독 계정으로 한 번 로그인해 두세요." if cfg.llm_provider == "claude_code"
+                else "설정에서 API 키를 넣으세요.")
+        body.append('<div class="card"><div class="step"><span class="n">2</span><h3>LLM 확인</h3></div>'
+                    f"<p>지금 방식: <b>{how}</b>. {hint} 방식은 <a href=\"/settings\">설정</a>에서 바꿉니다.</p>"
+                    + self._form("/setup/llm", "연결 확인 (LLM 1회 호출)", "/setup") + "</div>")
+        p = profile.load()
+        state = '<span class="badge ok">있음</span>' if p.exists else '<span class="badge warn">필요</span>'
+        body.append(f'<div class="card"><div class="step"><span class="n">3</span><h3>프로필 {state}</h3></div>'
+                    "<p>내 역할과 보고 대상, 정리 기준을 몇 가지 물어 프로필을 만듭니다. "
+                    f'<a href="/profile">{"프로필 보기" if p.exists else "프로필 만들기"}</a></p></div>')
+        body.append('<div class="card"><div class="step"><span class="n">4</span><h3>첫 초안 받기</h3></div>'
+                    "<p>슬랙에서 두괄이에게 DM으로 아무 메모나 보내세요. 예: <i>방금 김과장님 통화함. 견적서 금요일까지 "
+                    "다시 달라고 함</i>. 정리된 초안이 답글로 오고, 이 대시보드의 <a href=\"/\">건</a>에도 쌓입니다.</p></div>")
+        return self._page("첫 설정", "settings", "".join(body), msg)
+
+    def _restart_form(self) -> str:
+        if os.environ.get("DUGWALI_LAUNCHER") == "run.bat":
+            return self._form("/restart", "두괄이 다시 켜기", "/settings", True)
+        return '<span class="small">두괄이 창을 닫고 다시 실행하세요.</span>'
+
+    def page_settings(self, q: dict, msg: str) -> str:
+        body = ["<h1>설정</h1>"]
+        if self.restart_needed:
+            body.append(f'<div class="notice">다시 켜야 반영됩니다: {e(", ".join(self.restart_needed))} · '
+                        f"{self._restart_form()}</div>")
+        local = importlib.util.find_spec("faster_whisper") is not None
+        api_pkg = importlib.util.find_spec("anthropic") is not None
+        slack = ('<span class="badge warn">연결 안 됨</span>' if self.setup_mode
+                 else '<span class="badge ok">연결됨</span>' if self.bot else '<span class="badge">이 화면만 띄움</span>')
+        body.append(f'<div class="card">슬랙 {slack} · <a href="/setup">첫 설정·슬랙 다시 연결</a><div class="muted small">'
+                    f'이 PC 전사 패키지 {"설치됨" if local else "없음"} · Claude API 패키지 {"설치됨" if api_pkg else "없음"}'
+                    f" · 설정 파일 {e(str(cfg.env_path))}</div></div>")
+        ro = self._remote
+        if ro:
+            body.append('<div class="notice">다른 기기에서는 설정을 볼 수만 있습니다. 바꾸려면 두괄이가 켜진 PC에서 여세요.</div>')
+        dis = " disabled" if ro else ""
+        rows, group = [], None
+        for st in envfile.SETTINGS:
+            if st.group != group:
+                group = st.group
+                rows.append(f"<h2>{e(group)}</h2>")
+            cur = envfile.current(st)
+            if st.kind == "choice":
+                field = "".join(f'<label class="opt"><input type="radio" name="{st.key}" value="{e(v)}"'
+                                f'{" checked" if v == cur else ""}{dis}>{e(label)}</label>' for v, label in st.options)
+            elif st.kind == "flag":
+                field = (f'<label class="opt"><input type="checkbox" name="{st.key}" value="true"'
+                         f'{" checked" if cur == "true" else ""}{dis}>켜기</label>')
+            elif st.kind == "secret":
+                field = (f'<input type="password" name="{st.key}" autocomplete="off" placeholder="'
+                         f'{"저장돼 있음 · 바꿀 때만 입력" if cur else "비어 있음"}"{dis}>')
+            elif st.kind == "time":
+                field = f'<input type="time" name="{st.key}" value="{e(cur)}"{dis}>'
+            elif st.kind == "number":
+                field = f'<input type="number" min="0" name="{st.key}" value="{e(cur)}"{dis}>'
+            else:
+                field = f'<input type="text" name="{st.key}" value="{e(cur)}"{dis}>'
+            after = "" if st.attr else ' <span class="badge">다시 켜야 반영</span>'
+            help_ = f'<div class="muted small">{e(st.help)}</div>' if st.help else ""
+            rows.append(f'<div class="label">{e(st.label)}{after}</div>{field}{help_}')
+        save = "" if ro else '<p><button class="primary">저장</button></p>'
+        body.append(f'<form method="post" action="/settings">{self._hidden("/settings")}'
+                    f'<div class="card">{"".join(rows)}{save}</div></form>')
+        return self._page("설정", "settings", "".join(body), msg)
+
+    def _rule_draft(self, field: str) -> dict:
+        try:
+            return json.loads(self.store.get_state(f"rule_draft:{field}") or "{}")
+        except ValueError:
+            return {}
+
     def page_profile(self, q: dict, msg: str) -> str:
         p = profile.load()
-        hint = "" if p.exists else ('<div class="notice">프로필 파일이 없어 기본값으로 정리합니다. 만들려면 '
-                                    "<code>python -m dugwali.cli profile --init</code>을 실행하세요.</div>")
-        body = (f"<h1>프로필</h1><p class=\"muted\">내 메모를 어떤 기준과 양식으로 정리할지 적는 파일입니다. "
-                f"메모장으로 고치면 다음 정리부터 반영됩니다.</p>{hint}"
-                f"<h2>두괄이가 읽은 결과</h2><pre>{e(profile.describe(p))}</pre>"
-                f"<h2>LLM에 함께 보내는 내용</h2><pre>{e(p.prompt_text)}</pre>")
-        return self._page("프로필", "profile", body, msg)
+        if not p.exists:
+            return self._page("프로필", "profile", self._interview(), msg)
+        body = ["<h1>프로필</h1><p class=\"muted\">내 메모를 어떤 기준과 양식으로 정리할지 적는 곳입니다. "
+                "고치면 다음 정리부터 반영됩니다. 이 내용은 LLM을 부를 때마다 함께 보내니 밖으로 나가면 안 되는 정보는 "
+                "적지 마세요.</p>"]
+        cands = pipeline.rule_candidates(self.store)
+        if cands:
+            body.append(f"<h2>규칙으로 올릴까요? {len(cands)}개</h2><p class=\"muted small\">대시보드에서 같은 항목을 "
+                        f"{pipeline.RULE_THRESHOLD}번 이상 고쳤습니다. 규칙으로 올리면 다음 정리부터 처음부터 그렇게 씁니다. "
+                        "사람이 눌러야만 프로필에 들어갑니다.</p>")
+        for c in cands:
+            f = c["field"]
+            ex = "".join(f"<li><s class=\"muted\">{e(pipeline._short(x['before']))}</s> → {e(pipeline._short(x['after']))}</li>"
+                         for x in c["items"][:3])
+            draft = self._rule_draft(f)
+            reason = f'<div class="muted small">LLM이 본 공통점: {e(draft["reason"])}</div>' if draft.get("reason") else ""
+            body.append(
+                f'<div class="card"><h3>{e(c["label"])} · {len(c["items"])}번 고침</h3><ul>{ex}</ul>'
+                f'<form method="post" action="/rules/{e(f)}/add">{self._hidden("/profile")}'
+                f'<div class="label">더할 규칙 (정리 기준에 한 줄로 들어갑니다)</div>'
+                f'<textarea class="short" name="rule" placeholder="예: 결론 첫머리에 기한 넣기">{e(draft.get("rule", ""))}</textarea>'
+                f'{reason}<div class="actions"><button class="primary">프로필에 넣기</button></div></form>'
+                f'<div class="actions">{self._form(f"/rules/{f}/draft", "LLM으로 초안 만들기 (1회 호출)", "/profile")}'
+                f'{self._form(f"/rules/{f}/dismiss", "넘기기", "/profile")}</div></div>')
+        warn = "".join(f'<div class="notice">{e(w)}</div>' for w in p.warnings)
+        body.append(f"<h2>프로필 고치기</h2>{warn}"
+                    f'<form method="post" action="/profile/save">{self._hidden("/profile")}'
+                    f'<textarea name="text" style="min-height:420px">{e(p.path.read_text(encoding="utf-8"))}</textarea>'
+                    '<p><button class="primary">저장</button> <span class="muted small">저장하기 전 내용은 '
+                    f"{e(p.path.name)}.bak에 한 벌 남습니다. 파일: {e(str(p.path))}</span></p></form>"
+                    f"<h2>두괄이가 읽은 결과</h2><pre>{e(profile.describe(p))}</pre>"
+                    f"<h2>LLM에 함께 보내는 내용</h2><pre>{e(p.prompt_text)}</pre>")
+        return self._page("프로필", "profile", "".join(body), msg)
+
+    def _interview(self) -> str:
+        def label(name: str) -> str:
+            try:
+                head = (profile.EXAMPLES_DIR / f"{name}.md").read_text(encoding="utf-8").splitlines()[0]
+            except (OSError, IndexError):
+                head = ""
+            return head.split(":", 1)[1].strip() if ":" in head else "기본 (직무 무관)"
+        bases = "".join(f'<label class="opt"><input type="radio" name="base" value="{e(n)}"{" checked" if n == "default" else ""}>'
+                        f"{e(label(n))}</label>" for n in profile.examples())
+        return ("<h1>프로필 만들기</h1><p class=\"muted\">몇 가지만 답하면 프로필을 만들어 드립니다. 비워 둔 칸은 예시 "
+                "값으로 채우고, 나중에 언제든 고칠 수 있습니다. 답한 내용은 LLM을 부를 때마다 함께 보냅니다.</p>"
+                f'<form method="post" action="/profile/interview">{self._hidden("/profile")}<div class="card">'
+                '<div class="label">1. 무슨 일을 하나요?</div><input type="text" name="role" placeholder="예: 기업교육 PM">'
+                '<div class="label">2. 주로 누구에게 보고하나요?</div><input type="text" name="boss" placeholder="예: 박팀장">'
+                f'<div class="label">3. 가장 가까운 업무 유형</div>{bases}'
+                '<div class="label">4. 정리 말투</div>'
+                '<label class="opt"><input type="radio" name="tone" value="short" checked>짧은 개조식 ("견적서 재요청함", "금요일 회신 예정")</label>'
+                '<label class="opt"><input type="radio" name="tone" value="polite">짧은 존댓말 ("견적서를 다시 요청했습니다")</label>'
+                '<div class="label">5. 정리할 때 꼭 챙길 것 (한 줄에 하나, 선택)</div>'
+                '<textarea class="short" name="rules" placeholder="예: 금액은 부가세 포함 여부를 함께 적기"></textarea>'
+                '<div class="label">6. 자주 쓰는 용어·약어 (한 줄에 하나, 선택)</div>'
+                '<textarea class="short" name="terms" placeholder="예: 가견적 = 제안서 전에 규모만 파악하려고 내는 견적"></textarea>'
+                '<div class="label">메일 인사말 (선택)</div><input type="text" name="greeting" placeholder="예: {대상}님, 안녕하세요.">'
+                '<p><button class="primary">프로필 만들기</button></p></div></form>')
 
     # ---------- 쓰기 ----------
     def _background(self, fn, *args) -> None:
@@ -666,6 +861,44 @@ class Dashboard:
 
     def _sync_case(self, cid: int) -> None:
         self._sync_slack(*[r for r in self.store.case_records(cid) if r["data"]])
+
+    def _save_settings(self, form: dict) -> str:
+        """설정 화면 저장. 바로 반영할 수 있는 것은 cfg에도 넣고, 나머지는 다시 켜야 한다고 알린다."""
+        changes, errors = {}, []
+        for st in envfile.SETTINGS:
+            if st.kind == "secret":
+                raw = form.get(st.key, "").strip()
+                if not raw:
+                    continue          # 비워 두면 그대로 둔다
+            elif st.kind == "flag":
+                raw = "true" if form.get(st.key) == "true" else "false"
+            elif st.key in form:
+                raw = form[st.key]
+            else:
+                continue
+            try:
+                value = envfile.parse(st, raw)
+            except ValueError as err:
+                errors.append(str(err))
+                continue
+            if envfile.as_text(value) != envfile.current(st):
+                changes[st] = value
+        if errors:
+            return "저장하지 않았습니다. " + " ".join(errors)
+        if not changes:
+            return "바뀐 설정이 없습니다."
+        envfile.write({st.key: envfile.as_text(v) for st, v in changes.items()})
+        later = []
+        for st, value in changes.items():
+            needs_pkg = ((st.key == "STT_PROVIDER" and value == "local" and not importlib.util.find_spec("faster_whisper"))
+                         or (st.key == "LLM_PROVIDER" and value == "api" and not importlib.util.find_spec("anthropic")))
+            if st.attr and not needs_pkg:
+                setattr(cfg, st.attr, value)
+            else:
+                later.append(st.label)
+        self.restart_needed += [x for x in later if x not in self.restart_needed]
+        names = ", ".join(st.label for st in changes)
+        return f"저장했습니다: {names}." + (f" 다시 켜야 반영되는 것: {', '.join(later)}." if later else " 바로 반영했습니다.")
 
     def act(self, path: str, form: dict) -> tuple:
         """POST 한 건을 처리하고 (돌아갈 주소, 알림 문구[, 되돌리기 대상])를 돌려준다."""
@@ -778,6 +1011,67 @@ class Dashboard:
                         "keep": "남은 일로 두었습니다. 다시 완료로 추정하지 않습니다.",
                         "delete": "할 일을 휴지통으로 옮겼습니다."}[parts[2]]
                 return (back, text, f"todo:{num}") if parts[2] == "delete" else (back, text)
+
+        if parts and parts[0] in ("settings", "setup", "restart") and self._remote:
+            return "/settings", "설정은 두괄이가 켜진 PC에서만 바꿀 수 있습니다."
+        if parts == ["settings"]:
+            return "/settings", self._save_settings(form)
+        if parts == ["setup", "slack"]:
+            ok, self.slack_result = onboard.check_slack(form.get("bot", ""), form.get("app", ""), form.get("owner", ""))
+            if not ok:
+                return "/setup", "슬랙 확인을 통과하지 못했습니다. 아래 결과를 보세요."
+            values = {"SLACK_BOT_TOKEN": form["bot"].strip(), "SLACK_APP_TOKEN": form["app"].strip(),
+                      "OWNER_SLACK_USER_ID": form["owner"].strip()}
+            envfile.write(values)
+            if self.setup_mode:   # app.py가 기다리고 있다: 이 값으로 바로 봇을 띄운다
+                cfg.slack_bot_token, cfg.slack_app_token, cfg.owner_user_id = values.values()
+                self.slack_ready.set()
+                return "/setup", "슬랙에 연결했습니다. 내 DM의 확인 메시지를 보세요."
+            if "슬랙 토큰" not in self.restart_needed:
+                self.restart_needed.append("슬랙 토큰")
+            return "/setup", "확인하고 저장했습니다. 두괄이를 다시 켜면 새 슬랙 앱으로 연결합니다."
+        if parts == ["setup", "llm"]:
+            ok, text = onboard.check_llm()
+            return "/setup", ("✅ " if ok else "❌ LLM 연결 실패: ") + text
+        if parts == ["restart"] and os.environ.get("DUGWALI_LAUNCHER") == "run.bat":
+            threading.Timer(0.5, lambda: os._exit(3)).start()   # run.bat이 코드 3을 받으면 바로 다시 켠다
+            return "/settings", "다시 켜는 중입니다. 10초쯤 뒤에 새로 고치세요."
+
+        if parts == ["profile", "interview"]:
+            if profile.load().exists:
+                return "/profile", "프로필이 이미 있습니다. 아래에서 고치세요."
+            try:
+                profile.save(profile.from_interview(form, form.get("base", "default")))
+            except ValueError as err:
+                return "/profile", str(err)
+            return "/profile", "프로필을 만들었습니다. 다음 정리부터 반영됩니다. 아래에서 더 고칠 수 있습니다."
+        if parts == ["profile", "save"]:
+            text = form.get("text", "")
+            if not text.strip():
+                return "/profile", "비어 있는 프로필은 저장하지 않습니다."
+            profile.save(text)
+            warn = profile.load().warnings
+            return "/profile", "저장했습니다." + (f" 확인할 것 {len(warn)}개가 있습니다." if warn else "")
+        if len(parts) == 3 and parts[0] == "rules" and parts[1] in pipeline.RULE_FIELDS:
+            f = parts[1]
+            if parts[2] == "draft":
+                try:
+                    draft = pipeline.suggest_rule(store, f)
+                except (ValueError, pipeline.LLMError) as err:
+                    return "/profile", f"초안을 만들지 못했습니다: {err}"
+                store.set_state(f"rule_draft:{f}", json.dumps(draft, ensure_ascii=False))
+                return "/profile", ("초안을 만들었습니다. 고친 뒤 넣으세요." if draft["rule"]
+                                    else "공통된 방향을 찾지 못했습니다. 직접 적거나 넘기세요.")
+            if parts[2] == "add":
+                try:
+                    profile.add_rule(form.get("rule", ""))
+                except ValueError as err:
+                    return "/profile", str(err)
+            if parts[2] in ("add", "dismiss"):
+                store.review_corrections(f)
+                store.set_state(f"rule_draft:{f}", "{}")
+                return "/profile", ("정리 기준에 넣었습니다. 다음 정리부터 반영됩니다." if parts[2] == "add"
+                                    else "넘겼습니다. 같은 항목을 다시 여러 번 고치면 그때 다시 묻습니다.")
 
         if parts == ["import"]:
             text = transcript.clean(form.get("text", ""))
@@ -926,7 +1220,8 @@ class Dashboard:
                         page = dash.page_delete(parts[0][:-1], num, msg)
                     elif num is not None and parts[0] == "todos" and parts[2:] == ["edit"]:
                         page = dash.page_todo_edit(num, q, msg)
-                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile", "trash", "sessions"):
+                    elif len(parts) == 1 and parts[0] in ("todos", "attention", "import", "profile", "trash", "sessions",
+                                                          "settings", "setup"):
                         page = getattr(dash, f"page_{parts[0]}")(q, msg)
                     else:
                         page = None

@@ -86,6 +86,7 @@ _COLUMNS = [
     ("todos", "suspect", "INTEGER NOT NULL DEFAULT 0"),         # 완료 추정: LLM이 더는 언급하지 않음
     ("todos", "closed_by_case", "INTEGER NOT NULL DEFAULT 0"),  # 건을 종결하면서 완료 처리된 것
     ("todos", "deleted_at", "TEXT"),
+    ("corrections", "reviewed_at", "TEXT"),   # 규칙 후보로 보여주고 처리(올림·넘김)한 시각
 ]
 TRASH_DAYS = 30
 _SPACE = re.compile(r"[\s\W_]+")
@@ -534,6 +535,24 @@ class Store:
         with self._lock:
             return [dict(r) for r in self._db.execute(
                 "SELECT * FROM corrections ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def open_corrections(self, fields: set[str]) -> dict[str, list[dict]]:
+        """규칙 후보로 아직 처리하지 않은 수정(고치기 전 값이 있던 것만)을 필드별로, 최근 것부터."""
+        marks = ",".join("?" * len(fields))
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                f"SELECT * FROM corrections WHERE reviewed_at IS NULL AND before IS NOT NULL AND field IN ({marks})"
+                " ORDER BY id DESC", tuple(fields))]
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            if (r["before"] or "") != (r["after"] or ""):
+                out.setdefault(r["field"], []).append(r)
+        return out
+
+    def review_corrections(self, field: str) -> int:
+        with self._lock, self._db:
+            return self._db.execute("UPDATE corrections SET reviewed_at=? WHERE field=? AND reviewed_at IS NULL",
+                                    (_now(), field)).rowcount
 
     # --- sessions (다른 기기에서 대시보드에 로그인한 브라우저) ---
     def add_session(self, token_hash: str, agent: str, days: int) -> int:

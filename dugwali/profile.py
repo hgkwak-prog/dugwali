@@ -139,3 +139,78 @@ def describe(p: Profile | None = None) -> str:
              f"메일 맺음말: {p.mail_closing}"]
     lines += [f"⚠️ {w}" for w in p.warnings]
     return "\n".join(lines)
+
+
+# ---------- 대시보드에서 만들고 고치기 ----------
+RULES_HEADING = "정리 기준"
+TONES = {
+    "short": '- 모든 문장은 짧은 개조식 명사형 종결("~함", "~예정", "~필요")\n- 구두 보고 대본은 존댓말 구어체 3~4문장',
+    "polite": '- 문장은 짧은 존댓말 평서문("~했습니다", "~예정입니다")\n- 구두 보고 대본은 존댓말 구어체 3~4문장',
+}
+
+
+def _lines(text: str) -> list[str]:
+    return [f"- {x.strip().lstrip('-*• ').strip()}" for x in (text or "").splitlines() if x.strip().lstrip("-*• ").strip()]
+
+
+def set_section(text: str, name: str, body: str) -> str:
+    """`## name` 절의 본문을 바꾼다. 없으면 `## 양식` 앞(없으면 끝)에 새로 만든다."""
+    block = f"## {name}\n{body.strip()}\n"
+    m = re.search(rf"^##\s+{re.escape(name)}\s*$.*?(?=^##\s|\Z)", text, re.M | re.S)
+    if m:
+        return text[: m.start()] + block + ("\n" if text[m.end():] else "") + text[m.end():]
+    f = re.search(rf"^##\s+{FORMAT_HEADING}\s*$", text, re.M)
+    if f:
+        return text[: f.start()] + block + "\n" + text[f.start():]
+    return text.rstrip() + "\n\n" + block
+
+
+def section_body(text: str, name: str) -> str:
+    m = re.search(rf"^##\s+{re.escape(name)}\s*$\n?(.*?)(?=^##\s|\Z)", _COMMENT.sub("", text), re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def from_interview(answers: dict, base: str = "default") -> str:
+    """첫 실행 인터뷰 답으로 프로필 본문을 만든다. 고른 예시를 바탕으로 답한 칸만 바꾼다."""
+    src = EXAMPLES_DIR / f"{base}.md"
+    if base not in examples():
+        raise ValueError(f"'{base}' 예시가 없습니다.")
+    text = src.read_text(encoding="utf-8")
+    role, boss = (answers.get("role") or "").strip(), (answers.get("boss") or "").strip()
+    me = [f"- 역할: {role or '(내 역할)'}", f"- 주 보고 대상: {boss or '(보고 받는 사람)'}"]
+    text = set_section(text, "나", "\n".join(me))
+    if answers.get("tone") in TONES:
+        text = set_section(text, "말투", TONES[answers["tone"]])
+    extra = _lines(answers.get("rules", ""))
+    if extra:
+        rules = [x for x in section_body(text, RULES_HEADING).splitlines() if x.strip()]
+        text = set_section(text, RULES_HEADING, "\n".join(rules + extra))
+    terms = _lines(answers.get("terms", ""))
+    if terms:
+        text = set_section(text, "용어", "\n".join(terms))
+    greeting = (answers.get("greeting") or "").strip()
+    if greeting:
+        fmt = [x for x in section_body(text, FORMAT_HEADING).splitlines() if x.strip() and "메일 인사말" not in x]
+        text = set_section(text, FORMAT_HEADING, "\n".join(fmt + [f"- 메일 인사말: {greeting}"]))
+    return text
+
+
+def save(text: str) -> Path:
+    """프로필을 통째로 저장한다. 덮어쓰기 전 내용은 profile.md.bak에 한 벌 남긴다."""
+    dest = cfg.profile_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.with_name(dest.name + ".bak").write_text(dest.read_text(encoding="utf-8"), encoding="utf-8")
+    dest.write_text(text.replace("\r\n", "\n"), encoding="utf-8")
+    return dest
+
+
+def add_rule(rule: str) -> Path:
+    """`## 정리 기준`에 규칙 한 줄을 더한다. 프로필이 없으면 기본 예시로 만든 뒤 더한다."""
+    rule = rule.strip().lstrip("-*• ").strip()
+    if not rule:
+        raise ValueError("규칙이 비어 있습니다.")
+    dest = cfg.profile_path
+    text = dest.read_text(encoding="utf-8") if dest.exists() else (EXAMPLES_DIR / "default.md").read_text(encoding="utf-8")
+    rules = [x for x in section_body(text, RULES_HEADING).splitlines() if x.strip()]
+    return save(set_section(text, RULES_HEADING, "\n".join(rules + [f"- {rule}"])))
